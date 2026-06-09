@@ -1,7 +1,97 @@
-Version 2025-12.2.0.3
-    TMA SENSOR: DFRobot A01NYUB UART
-    PORT: 443
+# TMAT - Tinggi Muka Air Tanah
 
-Version 2025-12.2A.0.3
-    TMA SENSOR: GENERIC ULTRASONIC SENSOR
-    PORT: 443
+## Pin Configuration
+
+| Function  | GPIO   |
+| --------- | ------ |
+| Soil RX   | GPIO16 |
+| Soil TX   | GPIO17 |
+| I2C SDA   | GPIO8  |
+| I2C SCL   | GPIO9  |
+| SD CS     | GPIO10 |
+| SD MOSI   | GPIO11 |
+| SD MISO   | GPIO13 |
+| SD SCK    | GPIO12 |
+| AP Button | GPIO7  |
+
+---
+
+## Data Flow
+
+Sensors
+↓
+Logger
+↓
+Local Processing
+↓
+SD Card Backup
+↓
+HTTPS Upload
+↓
+Cloud Server
+
+If the server connection fails:
+
+Sensors
+↓
+Logger
+↓
+SD Card Storage
+↓
+Automatic Replay After Reconnection
+
+---
+
+## Testing dashboard
+https://dev.sinaubumi.org/
+
+### Calibration
+
+
+## Telemetry Payload Example
+
+```json
+{
+  "device_id": "TMAT_ARGL",
+  "timestamp": "09-06-2026_15:00:00",
+  "water_depth": 120.5,
+  "sensor_raw": 123.1,
+  "current_ma": 7.82,
+  "soil_temp": 29.1,
+  "soil_humid": 64.5,
+  "soil_ec": 542,
+  "soil_ph": 6.8,
+  "rain_total": 12.34,
+  "rain_1h": 1.12,
+  "rain_rate": 3.36,
+  "rain_tips": 44
+}
+```
+
+## Versioning
+
+Firmware versions follow the format:
+
+```
+v5.2.0
+```
+
+---
+
+## Project Status
+
+Testing Development
+
+Current Firmware:
+
+```
+20260609_TMAT_v5.2.0
+```
+
+---
+
+## License
+
+Copyright © Sinau Bumi
+
+All rights reserved.

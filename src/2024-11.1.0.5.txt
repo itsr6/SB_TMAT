@@ -1,0 +1,701 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <EEPROM.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <time.h>
+#include <WiFiClientSecure.h>
+
+// Hardware Configuration
+#define RX_PIN 4
+#define TX_PIN 5
+
+// EEPROM Configuration
+#define EEPROM_SIZE 128
+#define ADDR_SENSOR_HEIGHT 0
+#define ADDR_WIFI_SSID 10
+#define ADDR_WIFI_PASS 42
+#define ADDR_AP_PASS 74
+#define MAX_CRED_LENGTH 32
+
+// Network Configuration
+const char* ap_ssid = "SIBU03-TMAT";
+String ap_password = "";
+String sta_ssid = "";
+String sta_password = "";
+
+// Server configuration
+const char* serverHost = "www.smpr-geomet.com";  // Your server
+const char* serverPath = "/report_data/data_tma_subdas_ciapus.php";
+const int serverPort = 80;  // HTTPS
+
+// Device Configuration
+#define DEVICE_ID "TMAT03"
+
+// NTP Configuration
+const char* ntpServer1 = "pool.ntp.org";
+const char* ntpServer2 = "time.nist.gov";
+const long gmtOffset_sec = 25200;  // GMT+7
+const int daylightOffset_sec = 0;
+
+// System Defaults
+#define DEFAULT_SENSOR_HEIGHT 100.0
+#define SERVER_UPDATE_INTERVAL 20000  // 20 seconds in milliseconds
+
+// Global Variables
+WebServer server(80);
+
+unsigned char sensorData[4] = {};
+float distance = 0;
+float lastValidReading = 0;
+float sensorHeight = DEFAULT_SENSOR_HEIGHT;
+unsigned long lastConfigUpdate = 0;
+
+bool serverConnected = false;
+unsigned long lastServerSend = 0;
+unsigned long lastServerAttempt = 0;
+unsigned long lastWifiReconnectAttempt = 0;
+unsigned long lastTimeSync = 0;
+String lastServerStatus = "Not connected";
+char timeStampBuf[32];
+
+bool wifiSTAConnected = false;
+bool timeInitialized = false;
+
+struct WaterLevelData {
+  float sensorReading;
+  float waterDepth;
+  bool isValid;
+};
+
+// Function Prototypes
+void initializeTime();
+bool getFormattedTimestamp(char* buffer, size_t bufferSize);
+void readWiFiCredentials();
+void readAPPassword();
+void saveWiFiCredentials(String ssid, String password, String ap_password = "");
+void initializeWiFi();
+void checkWiFiConnection();
+bool sendToServer(float waterDepth);
+WaterLevelData readWaterLevel();
+String generateReadingsHtml();
+String generatePasswordField(const String& id, const String& value, const String& label);
+void handleWiFiConfig();
+void handleSaveSTA();
+void handleSaveAP();
+void handleRoot();
+void handleConfigure();
+unsigned long getCurrentEpochTime();
+
+void initializeTime() {
+  if (wifiSTAConnected) {
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2);
+    
+    time_t now = 0;
+    struct tm timeinfo;
+    int retry = 0;
+    const int maxRetry = 10;
+    
+    while (time(&now) < 1000000000 && retry < maxRetry) {
+      delay(500);
+      retry++;
+    }
+    
+    if (retry < maxRetry) {
+      timeInitialized = true;
+      lastTimeSync = millis();
+      getLocalTime(&timeinfo);
+      Serial.println("Time initialized successfully!");
+    }
+  }
+}
+
+bool getFormattedTimestamp(char* buffer, size_t bufferSize) {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    strcpy(buffer, "0000-00-00_00:00:00");
+    return false;
+  }
+  strftime(buffer, bufferSize, "%d-%m-%Y_%H:%M:%S", &timeinfo);
+  return true;
+}
+
+unsigned long getCurrentEpochTime() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    return 0;
+  }
+  time_t now;
+  time(&now);
+  return (unsigned long)now;
+}
+
+void readWiFiCredentials() {
+  char ssid_buf[MAX_CRED_LENGTH] = {0};
+  char pass_buf[MAX_CRED_LENGTH] = {0};
+  
+  for (int i = 0; i < MAX_CRED_LENGTH; i++) {
+    ssid_buf[i] = EEPROM.read(ADDR_WIFI_SSID + i);
+    pass_buf[i] = EEPROM.read(ADDR_WIFI_PASS + i);
+  }
+  
+  sta_ssid = String(ssid_buf);
+  sta_password = String(pass_buf);
+  sta_ssid.trim();
+  sta_password.trim();
+}
+
+void readAPPassword() {
+  char ap_pass_buf[MAX_CRED_LENGTH] = {0};
+  bool valid = false;
+  
+  for (int i = 0; i < MAX_CRED_LENGTH; i++) {
+    ap_pass_buf[i] = EEPROM.read(ADDR_AP_PASS + i);
+    if (ap_pass_buf[i] != 0 && ap_pass_buf[i] != 255) valid = true;
+  }
+  
+  ap_password = String(ap_pass_buf);
+  ap_password.trim();
+  
+  if (!valid || ap_password.isEmpty()) {
+    ap_password = "12345678";
+    for (int i = 0; i < ap_password.length(); i++) {
+      EEPROM.write(ADDR_AP_PASS + i, ap_password[i]);
+    }
+    EEPROM.commit();
+  }
+}
+
+void saveWiFiCredentials(String ssid, String password, String ap_password) {
+  // Clear existing data
+  for (int i = 0; i < MAX_CRED_LENGTH; i++) {
+    EEPROM.write(ADDR_WIFI_SSID + i, 0);
+    EEPROM.write(ADDR_WIFI_PASS + i, 0);
+    if (!ap_password.isEmpty()) {
+      EEPROM.write(ADDR_AP_PASS + i, 0);
+    }
+  }
+  
+  // Write new credentials
+  for (int i = 0; i < ssid.length() && i < MAX_CRED_LENGTH; i++) {
+    EEPROM.write(ADDR_WIFI_SSID + i, ssid[i]);
+  }
+  
+  for (int i = 0; i < password.length() && i < MAX_CRED_LENGTH; i++) {
+    EEPROM.write(ADDR_WIFI_PASS + i, password[i]);
+  }
+
+  if (!ap_password.isEmpty()) {
+    for (int i = 0; i < ap_password.length() && i < MAX_CRED_LENGTH; i++) {
+      EEPROM.write(ADDR_AP_PASS + i, ap_password[i]);
+    }
+  }
+  
+  EEPROM.commit();
+  sta_ssid = ssid;
+  sta_password = password;
+}
+
+void initializeWiFi() {
+  Serial.println("Initializing WiFi...");
+  WiFi.mode(WIFI_AP_STA);
+  
+  if (!WiFi.softAP(ap_ssid, ap_password.c_str())) {
+    WiFi.softAP(ap_ssid, "12345678");
+  }
+
+  if (sta_ssid.length() > 0) {
+    WiFi.begin(sta_ssid.c_str(), sta_password.c_str());
+    WiFi.setTxPower(WIFI_POWER_8_5dBm);
+    
+    unsigned long startTime = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startTime < 10000) {
+      delay(500);
+      Serial.print(".");
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiSTAConnected = true;
+      Serial.println("\nWiFi connected!");
+      Serial.print("IP address: ");
+      Serial.println(WiFi.localIP());
+      initializeTime();
+    }
+  }
+}
+
+void checkWiFiConnection() {
+  static unsigned long lastCheck = 0;
+  const unsigned long checkInterval = 30000;
+  
+  if (millis() - lastCheck >= checkInterval) {
+    lastCheck = millis();
+    
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi disconnected, attempting to reconnect...");
+      wifiSTAConnected = false;
+      WiFi.reconnect();
+      
+      unsigned long startTime = millis();
+      while (WiFi.status() != WL_CONNECTED && millis() - startTime < 10000) {
+        delay(500);
+        Serial.print(".");
+      }
+      
+      if (WiFi.status() == WL_CONNECTED) {
+        wifiSTAConnected = true;
+        Serial.println("\nWiFi reconnected!");
+        if (!timeInitialized) {
+          initializeTime();
+        }
+      } else {
+        Serial.println("\nWiFi reconnection failed");
+      }
+    }
+  }
+}
+
+bool sendToServer(float waterDepth) {
+  if (!wifiSTAConnected) {
+    lastServerStatus = "WiFi not connected";
+    Serial.println("Cannot send to server: WiFi not connected");
+    return false;
+  }
+
+  // Check if it's time to send (every 20 seconds)
+  if (millis() - lastServerAttempt < SERVER_UPDATE_INTERVAL) {
+    return false;
+  }
+
+  lastServerAttempt = millis();
+
+  Serial.println("========================================");
+  Serial.println("Preparing to send data to server...");
+  Serial.print("Server: ");
+  Serial.println(serverHost);
+  Serial.print("Port: ");
+  Serial.println(serverPort);
+  Serial.print("Path: ");
+  Serial.println(serverPath);
+
+  WiFiClientSecure client;
+  client.setInsecure(); // Skip certificate verification
+  
+  Serial.print("Connecting to server... ");
+  
+  if (!client.connect(serverHost, serverPort)) {
+    Serial.println("FAILED");
+    lastServerStatus = "Connection failed";
+    return false;
+  }
+  
+  Serial.println("SUCCESS");
+  
+  // Get timestamp
+  bool timeValid = getFormattedTimestamp(timeStampBuf, sizeof(timeStampBuf));
+  
+  // Create JSON document
+  DynamicJsonDocument doc(512);
+  
+  // Add water depth data
+  doc["device_id"] = DEVICE_ID;
+  doc["sensor_reading"] = distance;
+  doc["water_depth"] = waterDepth;
+  doc["sensor_height"] = sensorHeight;
+  doc["timestamp"] = timeStampBuf;
+  doc["epoch_time"] = getCurrentEpochTime();
+  
+  // Serialize JSON to string
+  String jsonString;
+  serializeJson(doc, jsonString);
+  
+  Serial.println("JSON Data to send:");
+  Serial.println(jsonString);
+  
+  // Prepare HTTP POST request
+  String postRequest = String("POST ") + serverPath + " HTTP/1.1\r\n" +
+                      "Host: " + serverHost + "\r\n" +
+                      "Content-Type: application/json\r\n" +
+                      "Content-Length: " + jsonString.length() + "\r\n" +
+                      "Connection: close\r\n\r\n" +
+                      jsonString;
+  
+  Serial.println("Sending HTTP request...");
+  Serial.println(postRequest.substring(0, 200) + "..."); // Print first 200 chars
+  
+  // Send request
+  client.print(postRequest);
+  
+  // Wait for response
+  unsigned long timeout = millis();
+  bool responseReceived = false;
+  String response = "";
+  int responseCode = 0;
+  
+  Serial.println("Waiting for response...");
+  
+  while (client.connected() && millis() - timeout < 10000) {
+    while (client.available()) {
+      String line = client.readStringUntil('\n');
+      response += line + "\n";
+      responseReceived = true;
+      
+      // Parse HTTP status code
+      if (line.startsWith("HTTP/1.1")) {
+        int space1 = line.indexOf(' ');
+        int space2 = line.indexOf(' ', space1 + 1);
+        if (space1 > 0 && space2 > space1) {
+          responseCode = line.substring(space1 + 1, space2).toInt();
+        }
+      }
+    }
+  }
+  
+  if (responseReceived) {
+    Serial.println("=== Server Response ===");
+    Serial.println("HTTP Response Code: " + String(responseCode));
+    Serial.println("Response Headers/Body:");
+    Serial.println(response);
+    Serial.println("======================");
+    
+    // Check if response contains success indication
+    if (responseCode == 200 || response.indexOf("success") > 0 || response.indexOf("Success") > 0) {
+      lastServerSend = millis();
+      lastServerStatus = "Success (HTTP " + String(responseCode) + ")";
+      serverConnected = true;
+      Serial.println("Server update SUCCESS");
+    } else {
+      lastServerStatus = "Server error: HTTP " + String(responseCode);
+      serverConnected = false;
+      Serial.println("Server update FAILED");
+    }
+  } else {
+    Serial.println("No response from server (timeout)");
+    lastServerStatus = "No response from server";
+    serverConnected = false;
+  }
+  
+  client.stop();
+  Serial.println("Connection closed");
+  Serial.println("========================================");
+  
+  return serverConnected;
+}
+
+WaterLevelData readWaterLevel() {
+  WaterLevelData result = {0, 0, false};
+  
+  if (Serial1.available() >= 4) {
+    for (int i = 0; i < 4; i++) {
+      sensorData[i] = Serial1.read();
+    }
+    
+    if (sensorData[0] == 0xff) {
+      int sum = (sensorData[0] + sensorData[1] + sensorData[2]) & 0x00FF;
+      
+      if (sum == sensorData[3]) {
+        distance = (sensorData[1] << 8) + sensorData[2];
+        
+        if (distance > 280) {
+          result.sensorReading = distance / 10.0;
+          result.waterDepth = (result.sensorReading * -1) + sensorHeight;
+          result.isValid = true;
+          Serial.print("Valid sensor reading: ");
+          Serial.print(result.sensorReading);
+          Serial.print(" cm, Depth: ");
+          Serial.print(result.waterDepth);
+          Serial.println(" cm");
+        }
+      }
+    }
+    
+    while (Serial1.available() > 0) Serial1.read();
+  }
+  
+  return result;
+}
+
+String generatePasswordField(const String& id, const String& value, const String& label) {
+  String html = "<label for='" + id + "'>" + label + ":</label>";
+  html += "<div style='display:flex;align-items:center;'>";
+  html += "<input type='password' id='" + id + "' name='" + id + "' value='" + value + "' style='flex-grow:1;'>";
+  html += "<button type='button' onclick=\"togglePassword('" + id + "')\" style='margin-left:5px;'>👁️</button>";
+  html += "</div>";
+  return html;
+}
+
+void handleWiFiConfig() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<title>WiFi Configuration</title>";
+  html += "<style>body { font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; }";
+  html += ".config-form { background: #f0f0f0; padding: 20px; margin: 20px 0; border-radius: 8px; }";
+  html += "input[type='text'], input[type='password'] { width: 100%; padding: 8px; margin: 8px 0; box-sizing: border-box; }";
+  html += ".button { background-color: #4CAF50; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; }";
+  html += ".status { padding: 10px; margin: 10px 0; border-radius: 4px; }";
+  html += ".success { background-color: #dff0d8; color: #3c763d; }";
+  html += ".error { background-color: #f2dede; color: #a94442; }";
+  html += ".tab { overflow: hidden; border: 1px solid #ccc; background-color: #f1f1f1; }";
+  html += ".tab button { background-color: inherit; float: left; border: none; outline: none; cursor: pointer; padding: 10px 16px; transition: 0.3s; }";
+  html += ".tab button:hover { background-color: #ddd; }";
+  html += ".tab button.active { background-color: #ccc; }";
+  html += ".tabcontent { display: none; padding: 6px 12px; border: 1px solid #ccc; border-top: none; }";
+  html += "</style>";
+  html += "<script>function togglePassword(id) { var x = document.getElementById(id); if (x.type === 'password') { x.type = 'text'; } else { x.type = 'password'; }}</script>";
+  html += "<script>function openTab(evt, tabName) { var i, tabcontent, tabbuttons; tabcontent = document.getElementsByClassName('tabcontent'); for (i = 0; i < tabcontent.length; i++) { tabcontent[i].style.display = 'none'; } tabbuttons = document.getElementsByClassName('tabbutton'); for (i = 0; i < tabbuttons.length; i++) { tabbuttons[i].className = tabbuttons[i].className.replace(' active', ''); } document.getElementById(tabName).style.display = 'block'; evt.currentTarget.className += ' active'; }</script>";
+  html += "</head><body>";
+  html += "<h1>WiFi Configuration</h1>";
+  
+  if (server.hasArg("sta_saved")) {
+    html += "<div class='status success'>STA configuration saved successfully!</div>";
+  } else if (server.hasArg("ap_saved")) {
+    html += "<div class='status success'>AP configuration saved successfully!</div>";
+  }
+
+  html += "<div class='tab'>";
+  html += "<button class='tabbutton active' onclick=\"openTab(event, 'STA')\">STA Settings</button>";
+  html += "<button class='tabbutton' onclick=\"openTab(event, 'AP')\">AP Settings</button>";
+  html += "</div>";
+
+  html += "<div id='STA' class='tabcontent' style='display:block;'>";
+  html += "<form action='/save-sta' method='post'>";
+  html += "<label for='sta_ssid'>WiFi SSID:</label>";
+  html += "<input type='text' id='sta_ssid' name='sta_ssid' value='" + sta_ssid + "' required>";
+  html += generatePasswordField("sta_password", sta_password, "WiFi Password");
+  html += "<input type='submit' value='Save STA Configuration' class='button'>";
+  html += "</form>";
+  html += "</div>";
+
+  html += "<div id='AP' class='tabcontent'>";
+  html += "<form action='/save-ap' method='post'>";
+  html += "<label for='ap_ssid'>AP SSID:</label>";
+  html += "<input type='text' id='ap_ssid' name='ap_ssid' value='" + String(ap_ssid) + "' required>";
+  html += generatePasswordField("ap_password", ap_password, "AP Password");
+  html += "<input type='submit' value='Save AP Configuration' class='button'>";
+  html += "</form>";
+  html += "</div>";
+
+  html += "<p><a href='/'>Return to main page</a></p>";
+  html += "</body></html>";
+  
+  server.send(200, "text/html", html);
+}
+
+void handleSaveSTA() {
+  if (server.hasArg("sta_ssid") && server.hasArg("sta_password")) {
+    String newSSID = server.arg("sta_ssid");
+    String newPass = server.arg("sta_password");
+    
+    if (newSSID.length() > 0) {
+      saveWiFiCredentials(newSSID, newPass, "");
+      WiFi.disconnect();
+      delay(1000);
+      initializeWiFi();
+      server.sendHeader("Location", "/wifi-config?sta_saved=1");
+      server.send(303);
+      return;
+    }
+  }
+  server.sendHeader("Location", "/wifi-config");
+  server.send(303);
+}
+
+void handleSaveAP() {
+  if (server.hasArg("ap_ssid") && server.hasArg("ap_password")) {
+    String newSSID = server.arg("ap_ssid");
+    String newPass = server.arg("ap_password");
+    
+    if (newSSID.length() > 0 && newPass.length() >= 8) {
+      saveWiFiCredentials("", "", newPass);
+      ap_ssid = newSSID.c_str();
+      WiFi.softAPdisconnect(true);
+      delay(500);
+      WiFi.softAP(ap_ssid, ap_password.c_str());
+      server.sendHeader("Location", "/wifi-config?ap_saved=1");
+      server.send(303);
+      return;
+    }
+  }
+  server.sendHeader("Location", "/wifi-config");
+  server.send(303);
+}
+
+String generateReadingsHtml() {
+  WaterLevelData waterData = readWaterLevel();
+  
+  String html = "<div class='reading'>";
+  html += "<h3>Current Readings</h3>";
+  html += "<table>";
+  html += "<tr><td>Device ID:</td><td>" + String(DEVICE_ID) + "</td></tr>";
+  html += "<tr><td>Sensor Reading:</td><td>" + String(waterData.sensorReading, 1) + " cm</td></tr>";
+  html += "<tr><td>Sensor Height:</td><td>" + String(sensorHeight, 1) + " cm</td></tr>";
+  html += "<tr><td><strong>Water Depth:</strong></td><td><strong>" + String(waterData.waterDepth, 1) + " cm</strong></td></tr>";
+  html += "</table>";
+  html += "</div>";
+  
+  html += "<div class='reading'>";
+  html += "<h3>Server Status</h3>";
+  html += "<table>";
+  html += "<tr><td>Server:</td><td>" + String(serverHost) + "</td></tr>";
+  html += "<tr><td>Path:</td><td>" + String(serverPath) + "</td></tr>";
+  html += "<tr><td>Update Interval:</td><td>20 seconds</td></tr>";
+  html += "<tr><td>Connection Status:</td><td>" + String(serverConnected ? "Connected" : "Disconnected") + "</td></tr>";
+  html += "<tr><td>Last Status:</td><td>" + lastServerStatus + "</td></tr>";
+  if (lastServerSend > 0) {
+    unsigned long secondsAgo = (millis() - lastServerSend) / 1000;
+    html += "<tr><td>Last Send:</td><td>" + String(secondsAgo) + " seconds ago</td></tr>";
+  }
+  html += "</table>";
+  html += "</div>";
+  
+  html += "<div class='reading'>";
+  html += "<h3>WiFi Status</h3>";
+  html += "<table>";
+  html += "<tr><td>STA Connection:</td><td>" + String(wifiSTAConnected ? "Connected" : "Disconnected") + "</td></tr>";
+  if (wifiSTAConnected) {
+    html += "<tr><td>STA IP:</td><td>" + WiFi.localIP().toString() + "</td></tr>";
+    html += "<tr><td>RSSI:</td><td>" + String(WiFi.RSSI()) + " dBm</td></tr>";
+  }
+  html += "<tr><td>AP SSID:</td><td>" + String(ap_ssid) + "</td></tr>";
+  html += "<tr><td>AP IP:</td><td>" + WiFi.softAPIP().toString() + "</td></tr>";
+  html += "<tr><td>Connected Stations:</td><td>" + String(WiFi.softAPgetStationNum()) + "</td></tr>";
+  html += "</table>";
+  html += "</div>";
+  
+  return html;
+}
+
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<title>Water Depth Monitor</title>";
+  html += "<style>body { font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; }";
+  html += ".reading { background: #f0f0f0; padding: 20px; margin: 20px 0; border-radius: 8px; }";
+  html += "table { width: 100%; border-collapse: collapse; }";
+  html += "td, th { padding: 8px; text-align: left; border: 1px solid #ddd; }";
+  html += ".button { background-color: #4CAF50; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; }";
+  html += ".status { padding: 10px; margin: 10px 0; border-radius: 4px; }";
+  html += ".success { background-color: #dff0d8; color: #3c763d; }";
+  html += ".warning { background-color: #fcf8e3; color: #8a6d3b; }</style>";
+  html += "<script>function updateReadings() { fetch('/readings').then(response => response.text()).then(data => { document.getElementById('readings').innerHTML = data; }).catch(err => console.log(err)); } setInterval(updateReadings, 2000); window.onload = updateReadings;</script>";
+  html += "</head><body>";
+  html += "<h1>Water Depth Monitoring System</h1>";
+
+  if (millis() - lastConfigUpdate < 2000) {
+    html += "<div class='status success'>Settings updated successfully</div>";
+  }
+  
+  html += "<div id='readings'>" + generateReadingsHtml() + "</div>";
+  
+  html += "<div class='reading'><h2>Sensor Configuration</h2>";
+  html += "<form action='/configure' method='post'>";
+  html += "<table><tr><td>Sensor Height (cm):</td><td><input type='number' step='0.1' name='sensorHeight' value='" + String(sensorHeight, 1) + "' required></td></tr>";
+  html += "</table><input type='submit' value='Update Configuration' class='button'></form></div>";
+  
+  html += "<div class='reading'><h2>WiFi Configuration</h2>";
+  html += "<p><a href='/wifi-config' class='button'>Configure WiFi Settings</a></p></div>";
+  
+  html += "</body></html>";
+  
+  server.send(200, "text/html", html);
+}
+
+void handleConfigure() {
+  if (server.hasArg("sensorHeight")) {
+    float newHeight = server.arg("sensorHeight").toFloat();
+    if (newHeight != sensorHeight && newHeight > 0) {
+      sensorHeight = newHeight;
+      EEPROM.writeFloat(ADDR_SENSOR_HEIGHT, sensorHeight);
+      EEPROM.commit();
+      lastConfigUpdate = millis();
+    }
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("\n========================================");
+  Serial.println("Water Depth Monitoring System");
+  Serial.println("Device ID: " + String(DEVICE_ID));
+  Serial.println("========================================");
+  
+  EEPROM.begin(EEPROM_SIZE);
+  if (EEPROM.read(ADDR_AP_PASS) == 255) {
+    saveWiFiCredentials("", "", "12345678");
+  }
+  
+  float savedHeight = EEPROM.readFloat(ADDR_SENSOR_HEIGHT);
+  if (!isnan(savedHeight) && savedHeight > 0) {
+    sensorHeight = savedHeight;
+  }
+  
+  readWiFiCredentials();
+  readAPPassword();
+  
+  Serial1.begin(9600, SERIAL_8N1, RX_PIN, -1);
+  initializeWiFi();
+  
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/readings", HTTP_GET, []() { server.send(200, "text/plain", generateReadingsHtml()); });
+  server.on("/configure", HTTP_POST, handleConfigure);
+  server.on("/wifi-config", HTTP_GET, handleWiFiConfig);
+  server.on("/save-sta", HTTP_POST, handleSaveSTA);
+  server.on("/save-ap", HTTP_POST, handleSaveAP);
+  server.begin();
+
+  Serial.println("Web server started");
+  Serial.print("AP SSID: ");
+  Serial.println(ap_ssid);
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+  Serial.println("System initialization complete");
+  Serial.println("========================================");
+}
+
+void loop() {
+  server.handleClient();
+  checkWiFiConnection();
+
+  static unsigned long lastSensorRead = 0;
+  static unsigned long lastStatusPrint = 0;
+  
+  if (millis() - lastSensorRead >= 1000) {
+    lastSensorRead = millis();
+    WaterLevelData waterData = readWaterLevel();
+    
+    // Always try to send every 20 seconds if we have WiFi
+    if (wifiSTAConnected) {
+      serverConnected = sendToServer(waterData.waterDepth);
+    }
+  }
+
+  if (millis() - lastStatusPrint >= 5000) { // Print status every 5 seconds
+    lastStatusPrint = millis();
+    WaterLevelData waterData = readWaterLevel();
+    
+    Serial.printf("\n=== System Status ===\n");
+    Serial.printf("Device ID: %s\n", DEVICE_ID);
+    Serial.printf("Sensor: %.1fcm | Depth: %.1fcm\n", waterData.sensorReading, waterData.waterDepth);
+    Serial.printf("STA: %s | RSSI: %d dBm\n",
+      wifiSTAConnected ? "Connected" : "Disconnected",
+      WiFi.RSSI());
+    Serial.printf("AP Clients: %d\n", WiFi.softAPgetStationNum());
+    Serial.printf("Server: %s\n", serverConnected ? "Connected" : "Disconnected");
+    Serial.printf("Last Server Status: %s\n", lastServerStatus.c_str());
+    
+    if (lastServerSend > 0) {
+      unsigned long secondsAgo = (millis() - lastServerSend) / 1000;
+      Serial.printf("Last send: %lu seconds ago\n", secondsAgo);
+    }
+    
+    Serial.printf("Time: %s\n", timeStampBuf);
+    Serial.printf("===================\n");
+  }
+
+  delay(10);
+}

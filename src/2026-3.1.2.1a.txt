@@ -1,0 +1,1018 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <EEPROM.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <time.h>
+#include <WiFiClientSecure.h>
+#include <Update.h>
+
+// Firmware Information
+#define FIRMWARE_NAME    "KLHK PEAT TMAT FORMAT"
+#define FIRMWARE_VERSION "2026-3.1.2.1_JBP"
+#define FIRMWARE_AUTHOR  "Dep.Instrumen"
+
+// Hardware Configuration (AJSR-04M GPIO trigger/echo mode)
+#define TRIG_PIN 41 // non-ADC pin, no interference with soil sensors
+#define ECHO_PIN 42 // non-ADC pin, no interference with soil sensors
+
+// Soil Moisture Sensor Pins (4 sensors)
+#define SOIL_PIN_1 6
+#define SOIL_PIN_2 7
+#define SOIL_PIN_3 8
+#define SOIL_PIN_4 9
+#define NUM_SOIL_SENSORS 4
+const int soilPins[NUM_SOIL_SENSORS] = {SOIL_PIN_1, SOIL_PIN_2, SOIL_PIN_3, SOIL_PIN_4};
+
+// EEPROM Configuration
+#define EEPROM_SIZE         512
+#define ADDR_SENSOR_HEIGHT  0
+#define ADDR_WIFI_SSID      10
+#define ADDR_WIFI_PASS      42
+#define ADDR_AP_PASS        74
+#define ADDR_SERVER_HOST    106
+#define ADDR_SERVER_PATH    170
+#define ADDR_SERVER_PORT    234
+#define ADDR_UPDATE_INTERVAL 298
+
+// Soil calibration EEPROM addresses (4 sensors)
+#define ADDR_SOIL1_DRY 302
+#define ADDR_SOIL1_WET 306
+#define ADDR_SOIL2_DRY 310
+#define ADDR_SOIL2_WET 314
+#define ADDR_SOIL3_DRY 318
+#define ADDR_SOIL3_WET 322
+#define ADDR_SOIL4_DRY 326
+#define ADDR_SOIL4_WET 330
+
+#define MAX_CRED_LENGTH   32
+#define MAX_SERVER_LENGTH 64
+
+// Network Configuration
+const char* ap_ssid    = "SIBU03";
+String ap_password     = "";
+String sta_ssid        = "";
+String sta_password    = "";
+
+// Server configuration
+String serverHost              = "";
+String serverPath              = "";
+int    serverPort              = 0;
+unsigned long serverUpdateInterval = 20000;
+
+// Device Configuration
+#define DEVICE_ID "SIBU_03"
+
+// NTP Configuration
+const char* ntpServer1       = "pool.ntp.org";
+const char* ntpServer2       = "time.nist.gov";
+const long  gmtOffset_sec    = 25200; // GMT+7
+const int   daylightOffset_sec = 0;
+
+// System Defaults
+#define DEFAULT_SENSOR_HEIGHT   100.0
+#define DEFAULT_UPDATE_INTERVAL 20000
+#define DEFAULT_SOIL_DRY        3000
+#define DEFAULT_SOIL_WET        1000
+
+// Global Variables
+WebServer server(80);
+
+float distance       = 0;
+float distance_cm    = 0;
+float sensorHeight   = DEFAULT_SENSOR_HEIGHT;
+unsigned long lastConfigUpdate = 0;
+
+bool  serverConnected         = false;
+unsigned long lastServerSend  = 0;
+unsigned long lastServerAttempt = 0;
+String lastServerStatus       = "Not configured";
+char   timeStampBuf[32];
+
+bool wifiSTAConnected = false;
+bool timeInitialized  = false;
+
+// Soil moisture variables
+int  soilRaw[NUM_SOIL_SENSORS]      = {0};
+int  soilPercent[NUM_SOIL_SENSORS]  = {0};
+int  soilDryValues[NUM_SOIL_SENSORS] = {DEFAULT_SOIL_DRY, DEFAULT_SOIL_DRY, DEFAULT_SOIL_DRY, DEFAULT_SOIL_DRY};
+int  soilWetValues[NUM_SOIL_SENSORS] = {DEFAULT_SOIL_WET, DEFAULT_SOIL_WET, DEFAULT_SOIL_WET, DEFAULT_SOIL_WET};
+bool soilCalibrated[NUM_SOIL_SENSORS] = {false};
+
+struct WaterLevelData {
+  float sensorReading;
+  float waterDepth;
+  bool  isValid;
+};
+
+// Function Prototypes
+void initializeTime();
+bool getFormattedTimestamp(char* buffer, size_t bufferSize);
+void readWiFiCredentials();
+void readAPPassword();
+void readServerConfig();
+void readUpdateInterval();
+void saveWiFiCredentials(String ssid, String password, String ap_password = "");
+void saveServerConfig(String host, String path, int port, unsigned long interval);
+void saveUpdateInterval(unsigned long interval);
+void initializeWiFi();
+void checkWiFiConnection();
+bool sendToServer(float waterDepth);
+WaterLevelData readWaterLevel();
+String generateReadingsHtml();
+String generatePasswordField(const String& id, const String& value, const String& label);
+void handleWiFiConfig();
+void handleSaveSTA();
+void handleSaveAP();
+void handleSaveServer();
+void handleRoot();
+void handleConfigure();
+unsigned long getCurrentEpochTime();
+void handleOTAUpdate();
+void handleOTAUpload();
+void readSoilCalibration();
+void saveSoilCalibration(int sensorIdx, int dry, int wet);
+void readSoilMoisture();
+int  computeSoilPercent(int raw, int dry, int wet);
+void handleSetSoilDry();
+void handleSetSoilWet();
+void handleResetSoilCalib();
+
+// Time functions
+void initializeTime() {
+  if (wifiSTAConnected) {
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2);
+    time_t now = 0;
+    int retry = 0;
+    while (time(&now) < 1000000000 && retry < 10) {
+      delay(500);
+      retry++;
+    }
+    if (retry < 10) {
+      timeInitialized = true;
+      Serial.println("Time initialized successfully!");
+    }
+  }
+}
+
+bool getFormattedTimestamp(char* buffer, size_t bufferSize) {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    strcpy(buffer, "0000-00-00_00:00:00");
+    return false;
+  }
+  strftime(buffer, bufferSize, "%d-%m-%Y_%H:%M:%S", &timeinfo);
+  return true;
+}
+
+unsigned long getCurrentEpochTime() {
+  time_t now;
+  time(&now);
+  return (unsigned long)now;
+}
+
+// EEPROM functions
+void readWiFiCredentials() {
+  char ssid_buf[MAX_CRED_LENGTH] = {0};
+  char pass_buf[MAX_CRED_LENGTH] = {0};
+  for (int i = 0; i < MAX_CRED_LENGTH; i++) {
+    ssid_buf[i] = EEPROM.read(ADDR_WIFI_SSID + i);
+    pass_buf[i] = EEPROM.read(ADDR_WIFI_PASS + i);
+  }
+  sta_ssid = String(ssid_buf); sta_ssid.trim();
+  sta_password = String(pass_buf); sta_password.trim();
+}
+
+void readAPPassword() {
+  char ap_pass_buf[MAX_CRED_LENGTH] = {0};
+  bool valid = false;
+  for (int i = 0; i < MAX_CRED_LENGTH; i++) {
+    ap_pass_buf[i] = EEPROM.read(ADDR_AP_PASS + i);
+    if (ap_pass_buf[i] != 0 && ap_pass_buf[i] != 255) valid = true;
+  }
+  ap_password = String(ap_pass_buf); ap_password.trim();
+  if (!valid || ap_password.isEmpty()) {
+    ap_password = "12345678";
+    for (int i = 0; i < (int)ap_password.length(); i++)
+      EEPROM.write(ADDR_AP_PASS + i, ap_password[i]);
+    EEPROM.commit();
+  }
+}
+
+void readUpdateInterval() {
+  unsigned long interval = 0;
+  for (int i = 0; i < 4; i++)
+    interval |= ((unsigned long)EEPROM.read(ADDR_UPDATE_INTERVAL + i) << (i * 8));
+  if (interval == 0xFFFFFFFF || interval < 1000 || interval > 86400000) {
+    serverUpdateInterval = DEFAULT_UPDATE_INTERVAL;
+    saveUpdateInterval(serverUpdateInterval);
+  } else {
+    serverUpdateInterval = interval;
+  }
+  Serial.printf("Server update interval: %lu seconds\n", serverUpdateInterval / 1000);
+}
+
+void readServerConfig() {
+  char host_buf[MAX_SERVER_LENGTH] = {0};
+  char path_buf[MAX_SERVER_LENGTH] = {0};
+  for (int i = 0; i < MAX_SERVER_LENGTH; i++) {
+    host_buf[i] = EEPROM.read(ADDR_SERVER_HOST + i);
+    path_buf[i] = EEPROM.read(ADDR_SERVER_PATH + i);
+  }
+  serverHost = String(host_buf); serverHost.trim();
+  serverPath = String(path_buf); serverPath.trim();
+  serverPort = EEPROM.read(ADDR_SERVER_PORT) | (EEPROM.read(ADDR_SERVER_PORT + 1) << 8);
+  readUpdateInterval();
+
+  bool configValid = true;
+  if (serverHost.isEmpty() || serverHost.indexOf('.') == -1) { configValid = false; Serial.println("Server host not configured or invalid"); }
+  if (serverPath.isEmpty() || serverPath.charAt(0) != '/')   { configValid = false; Serial.println("Server path not configured or invalid"); }
+  if (serverPort <= 0 || serverPort > 65535)                  { configValid = false; Serial.println("Server port not configured or invalid"); }
+
+  if (!configValid) {
+    lastServerStatus = "Not configured - Please set up server in web interface";
+  } else {
+    Serial.println("Server configuration loaded from EEPROM");
+  }
+}
+
+void saveUpdateInterval(unsigned long interval) {
+  for (int i = 0; i < 4; i++)
+    EEPROM.write(ADDR_UPDATE_INTERVAL + i, (interval >> (i * 8)) & 0xFF);
+  serverUpdateInterval = interval;
+}
+
+void saveWiFiCredentials(String ssid, String password, String ap_pass) {
+  for (int i = 0; i < MAX_CRED_LENGTH; i++) {
+    EEPROM.write(ADDR_WIFI_SSID + i, 0);
+    EEPROM.write(ADDR_WIFI_PASS + i, 0);
+    if (!ap_pass.isEmpty()) EEPROM.write(ADDR_AP_PASS + i, 0);
+  }
+  for (int i = 0; i < (int)ssid.length() && i < MAX_CRED_LENGTH; i++)
+    EEPROM.write(ADDR_WIFI_SSID + i, ssid[i]);
+  for (int i = 0; i < (int)password.length() && i < MAX_CRED_LENGTH; i++)
+    EEPROM.write(ADDR_WIFI_PASS + i, password[i]);
+  if (!ap_pass.isEmpty())
+    for (int i = 0; i < (int)ap_pass.length() && i < MAX_CRED_LENGTH; i++)
+      EEPROM.write(ADDR_AP_PASS + i, ap_pass[i]);
+  EEPROM.commit();
+  sta_ssid = ssid;
+  sta_password = password;
+}
+
+void saveServerConfig(String host, String path, int port, unsigned long interval) {
+  for (int i = 0; i < MAX_SERVER_LENGTH; i++) {
+    EEPROM.write(ADDR_SERVER_HOST + i, 0);
+    EEPROM.write(ADDR_SERVER_PATH + i, 0);
+  }
+  for (int i = 0; i < (int)host.length() && i < MAX_SERVER_LENGTH; i++)
+    EEPROM.write(ADDR_SERVER_HOST + i, host[i]);
+  for (int i = 0; i < (int)path.length() && i < MAX_SERVER_LENGTH; i++)
+    EEPROM.write(ADDR_SERVER_PATH + i, path[i]);
+  EEPROM.write(ADDR_SERVER_PORT,     port & 0xFF);
+  EEPROM.write(ADDR_SERVER_PORT + 1, (port >> 8) & 0xFF);
+  saveUpdateInterval(interval);
+  EEPROM.commit();
+  serverHost = host;
+  serverPath = path;
+  serverPort = port;
+  serverUpdateInterval = interval;
+  Serial.printf("Server config saved -> Host:%s Path:%s Port:%d Interval:%lus\n",
+                host.c_str(), path.c_str(), port, interval / 1000);
+}
+
+// Soil Moisture
+void readSoilCalibration() {
+  const int dryAddrs[NUM_SOIL_SENSORS] = {ADDR_SOIL1_DRY, ADDR_SOIL2_DRY, ADDR_SOIL3_DRY, ADDR_SOIL4_DRY};
+  const int wetAddrs[NUM_SOIL_SENSORS] = {ADDR_SOIL1_WET, ADDR_SOIL2_WET, ADDR_SOIL3_WET, ADDR_SOIL4_WET};
+  bool allValid = true;
+  for (int i = 0; i < NUM_SOIL_SENSORS; i++) {
+    int dry = 0, wet = 0;
+    for (int b = 0; b < 4; b++) {
+      dry |= (EEPROM.read(dryAddrs[i] + b) << (b * 8));
+      wet |= (EEPROM.read(wetAddrs[i] + b) << (b * 8));
+    }
+    if (dry >= 0 && dry <= 4095 && wet >= 0 && wet <= 4095 && dry != wet) {
+      soilDryValues[i] = dry;
+      soilWetValues[i] = wet;
+      soilCalibrated[i] = true;
+    } else {
+      soilDryValues[i] = DEFAULT_SOIL_DRY;
+      soilWetValues[i] = DEFAULT_SOIL_WET;
+      soilCalibrated[i] = false;
+      allValid = false;
+    }
+  }
+  if (!allValid) {
+    for (int i = 0; i < NUM_SOIL_SENSORS; i++)
+      saveSoilCalibration(i, soilDryValues[i], soilWetValues[i]);
+    Serial.println("Soil calibration defaults saved.");
+  }
+  for (int i = 0; i < NUM_SOIL_SENSORS; i++)
+    Serial.printf("  Soil %d: dry=%d wet=%d\n", i+1, soilDryValues[i], soilWetValues[i]);
+}
+
+void saveSoilCalibration(int idx, int dry, int wet) {
+  if (idx < 0 || idx >= NUM_SOIL_SENSORS) return;
+  const int dryAddrs[NUM_SOIL_SENSORS] = {ADDR_SOIL1_DRY, ADDR_SOIL2_DRY, ADDR_SOIL3_DRY, ADDR_SOIL4_DRY};
+  const int wetAddrs[NUM_SOIL_SENSORS] = {ADDR_SOIL1_WET, ADDR_SOIL2_WET, ADDR_SOIL3_WET, ADDR_SOIL4_WET};
+  for (int i = 0; i < 4; i++) {
+    EEPROM.write(dryAddrs[idx] + i, (dry >> (i * 8)) & 0xFF);
+    EEPROM.write(wetAddrs[idx] + i, (wet >> (i * 8)) & 0xFF);
+  }
+  EEPROM.commit();
+  soilDryValues[idx] = dry;
+  soilWetValues[idx] = wet;
+  soilCalibrated[idx] = true;
+  Serial.printf("Soil calib saved sensor %d: dry=%d wet=%d\n", idx+1, dry, wet);
+}
+
+void readSoilMoisture() {
+  // Wait for any ultrasonic noise to settle before ADC reads
+  delay(20);
+  // Average 5 samples per sensor to reduce noise
+  for (int i = 0; i < NUM_SOIL_SENSORS; i++) {
+    long sum = 0;
+    for (int s = 0; s < 5; s++) {
+      sum += analogRead(soilPins[i]);
+      delay(5);
+    }
+    soilRaw[i]     = sum / 5;
+    soilPercent[i] = computeSoilPercent(soilRaw[i], soilDryValues[i], soilWetValues[i]);
+  }
+}
+
+int computeSoilPercent(int raw, int dry, int wet) {
+  if (dry == wet) return 0;
+  if (raw >= dry) return 0;    // at or above dry threshold = 0% moisture
+  if (raw <= wet) return 100;  // at or below wet threshold = 100% moisture
+  return map(raw, dry, wet, 0, 100); // dry(high)→0%, wet(low)→100%
+}
+
+void handleSetSoilDry() {
+  if (server.hasArg("sensor")) {
+    int idx = server.arg("sensor").toInt() - 1;
+    if (idx >= 0 && idx < NUM_SOIL_SENSORS) {
+      readSoilMoisture();
+      saveSoilCalibration(idx, soilRaw[idx], soilWetValues[idx]);
+    }
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleSetSoilWet() {
+  if (server.hasArg("sensor")) {
+    int idx = server.arg("sensor").toInt() - 1;
+    if (idx >= 0 && idx < NUM_SOIL_SENSORS) {
+      readSoilMoisture();
+      saveSoilCalibration(idx, soilDryValues[idx], soilRaw[idx]);
+    }
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleResetSoilCalib() {
+  for (int i = 0; i < NUM_SOIL_SENSORS; i++)
+    saveSoilCalibration(i, DEFAULT_SOIL_DRY, DEFAULT_SOIL_WET);
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+// WiFi
+void initializeWiFi() {
+  Serial.println("Initializing WiFi...");
+  WiFi.mode(WIFI_AP_STA);
+  if (!WiFi.softAP(ap_ssid, ap_password.c_str()))
+    WiFi.softAP(ap_ssid, "12345678");
+
+  if (sta_ssid.length() > 0) {
+    WiFi.begin(sta_ssid.c_str(), sta_password.c_str());
+    WiFi.setTxPower(WIFI_POWER_8_5dBm);
+    unsigned long startTime = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startTime < 10000) {
+      delay(500); Serial.print(".");
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiSTAConnected = true;
+      Serial.println("\nWiFi connected! IP: " + WiFi.localIP().toString());
+      initializeTime();
+    } else {
+      Serial.println("\nWiFi connection failed.");
+    }
+  }
+}
+
+void checkWiFiConnection() {
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck < 30000) return;
+  lastCheck = millis();
+  if (WiFi.status() != WL_CONNECTED) {
+    wifiSTAConnected = false;
+    Serial.println("WiFi disconnected, reconnecting...");
+    WiFi.reconnect();
+    unsigned long startTime = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startTime < 10000) {
+      delay(500); Serial.print(".");
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiSTAConnected = true;
+      Serial.println("\nWiFi reconnected!");
+      if (!timeInitialized) initializeTime();
+    } else {
+      Serial.println("\nWiFi reconnection failed.");
+    }
+  }
+}
+
+// sendToServer — FIXED: uses HTTPClient, correct Host header, HTTP/HTTPS auto-detect
+bool sendToServer(float waterDepth) {
+  if (!wifiSTAConnected) {
+    lastServerStatus = "WiFi not connected";
+    return false;
+  }
+  if (serverHost.isEmpty() || serverPath.isEmpty() || serverPort <= 0) {
+    lastServerStatus = "Server not configured";
+    return false;
+  }
+  if (millis() - lastServerAttempt < serverUpdateInterval) return false;
+
+  lastServerAttempt = millis();
+
+  getFormattedTimestamp(timeStampBuf, sizeof(timeStampBuf));
+  distance_cm = distance / 10.0;
+
+  DynamicJsonDocument doc(1024);
+  doc["device_id"]     = DEVICE_ID;
+  doc["sensor_raw"]    = distance_cm;
+  doc["water_depth"]   = waterDepth;
+  doc["sensor_height"] = sensorHeight;
+  doc["epoch_time"]    = getCurrentEpochTime();
+  doc["soil_sensor1"]  = soilPercent[0];
+  doc["soil_sensor2"]  = soilPercent[1];
+  doc["soil_sensor3"]  = soilPercent[2];
+  doc["soil_sensor4"]  = soilPercent[3];
+
+  String jsonString;
+  serializeJson(doc, jsonString);
+
+  Serial.println("========================================");
+  Serial.println("Sending data to server...");
+  Serial.println(jsonString);
+
+  // ✅ FIX: Declare clients at function scope so they are NOT destroyed before http.POST() runs.
+  //         The "Bad file number" errno:9 error was caused by WiFiClient going out of scope
+  //         inside the if-block while HTTPClient still held a reference to it.
+  bool useSSL = (serverPort == 443);
+  String url  = (useSSL ? "https://" : "http://") + serverHost + ":" + String(serverPort) + serverPath;
+  Serial.println("URL: " + url);
+
+  WiFiClient        plainClient;
+  WiFiClientSecure  secureClient;
+  HTTPClient        http;
+  bool begun = false;
+
+  if (useSSL) {
+    secureClient.setInsecure();  // Accept self-signed certs
+    begun = http.begin(secureClient, url);
+  } else {
+    begun = http.begin(plainClient, url);
+  }
+
+  if (!begun) {
+    Serial.println("HTTPClient.begin() failed");
+    lastServerStatus = "Connection failed";
+    serverConnected  = false;
+    http.end();
+    return false;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(10000);
+
+  int httpCode = http.POST(jsonString);
+
+  Serial.printf("HTTP Response Code: %d\n", httpCode);
+
+  if (httpCode == 200 || httpCode == 201) {
+    lastServerStatus = "Success (HTTP " + String(httpCode) + ")";
+    serverConnected  = true;
+    lastServerSend   = millis();
+    Serial.println("Server update SUCCESS");
+  } else if (httpCode < 0) {
+    lastServerStatus = "Connection error: " + http.errorToString(httpCode);
+    serverConnected  = false;
+    Serial.println("Server error: " + http.errorToString(httpCode));
+  } else {
+    lastServerStatus = "Server error: HTTP " + String(httpCode);
+    serverConnected  = false;
+    Serial.println("Server returned error: " + String(httpCode));
+    Serial.println("Response: " + http.getString());
+  }
+
+  http.end();
+  Serial.println("========================================");
+  return serverConnected;
+}
+
+// Water level sensor — AJSR-04M (GPIO trigger/echo mode)
+// AJSR-04M in mode 1 (R19 = low): standard HC-SR04 timing
+// Trig: 10us HIGH pulse -> Echo: pulse width proportional to distance
+// Range: ~20-700 cm; speed of sound ~340 m/s
+WaterLevelData readWaterLevel() {
+  WaterLevelData result = {0, 0, false};
+
+  // Send 10us trigger pulse
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  // Read echo pulse duration (timeout 38ms -> ~650 cm, near sensor max)
+  long duration = pulseIn(ECHO_PIN, HIGH, 38000);
+
+  if (duration > 0) {
+    // Distance in mm: duration(us) * 0.34 / 2
+    distance = (duration * 0.34f) / 2.0f;       // mm
+    if (distance > 200 && distance < 7000) {     // valid range 20-700 cm in mm
+      result.sensorReading = distance / 10.0f;   // mm -> cm
+      result.waterDepth    = sensorHeight - result.sensorReading;
+      result.isValid       = true;
+    }
+  }
+  return result;
+}
+
+// HTML helpers
+String generatePasswordField(const String& id, const String& value, const String& label) {
+  String html  = "<label for='" + id + "'>" + label + ":</label>";
+  html += "<div style='display:flex;align-items:center;'>";
+  html += "<input type='password' id='" + id + "' name='" + id + "' value='" + value + "' style='flex-grow:1;'>";
+  html += "<button type='button' onclick=\"togglePassword('" + id + "')\" style='margin-left:5px;'>Show</button>";
+  html += "</div>";
+  return html;
+}
+
+String generateReadingsHtml() {
+  WaterLevelData waterData = readWaterLevel();
+  String html = "<div class='reading'>";
+  html += "<h3>Current Readings</h3><table>";
+  html += "<tr><td>Device ID:</td><td>" + String(DEVICE_ID) + "</td></tr>";
+  html += "<tr><td>Sensor Reading:</td><td>" + String(waterData.sensorReading, 1) + " cm</td></tr>";
+  html += "<tr><td>Sensor Height:</td><td>" + String(sensorHeight, 1) + " cm</td></tr>";
+  html += "<tr><td><strong>Water Depth:</strong></td><td><strong>" + String(waterData.waterDepth, 1) + " cm</strong></td></tr>";
+  html += "<tr><td colspan='2'><strong>Soil Moisture:</strong></td></tr>";
+  for (int i = 0; i < NUM_SOIL_SENSORS; i++)
+    html += "<tr><td>Sensor " + String(i+1) + ":</td><td>Raw=" + String(soilRaw[i]) + ", " + String(soilPercent[i]) + "%</td></tr>";
+  html += "</table></div>";
+
+  html += "<div class='reading'><h3>Server Status</h3><table>";
+  html += "<tr><td>Server:</td><td>" + (serverHost.isEmpty() ? "Not configured" : serverHost) + "</td></tr>";
+  html += "<tr><td>Path:</td><td>"   + (serverPath.isEmpty() ? "Not configured" : serverPath) + "</td></tr>";
+  html += "<tr><td>Port:</td><td>"   + (serverPort == 0 ? "Not configured" : String(serverPort)) + "</td></tr>";
+  html += "<tr><td>Interval:</td><td>" + String(serverUpdateInterval / 1000) + " s</td></tr>";
+  html += "<tr><td>Status:</td><td>" + String(serverConnected ? "Connected" : "Disconnected") + "</td></tr>";
+  html += "<tr><td>Last Status:</td><td>" + lastServerStatus + "</td></tr>";
+  if (lastServerSend > 0)
+    html += "<tr><td>Last Send:</td><td>" + String((millis() - lastServerSend) / 1000) + "s ago</td></tr>";
+  html += "</table></div>";
+
+  html += "<div class='reading'><h3>WiFi Status</h3><table>";
+  html += "<tr><td>STA:</td><td>" + String(wifiSTAConnected ? "Connected" : "Disconnected") + "</td></tr>";
+  if (wifiSTAConnected) {
+    html += "<tr><td>IP:</td><td>" + WiFi.localIP().toString() + "</td></tr>";
+    html += "<tr><td>RSSI:</td><td>" + String(WiFi.RSSI()) + " dBm</td></tr>";
+  }
+  html += "<tr><td>AP SSID:</td><td>" + String(ap_ssid) + "</td></tr>";
+  html += "<tr><td>AP IP:</td><td>"   + WiFi.softAPIP().toString() + "</td></tr>";
+  html += "<tr><td>AP Clients:</td><td>" + String(WiFi.softAPgetStationNum()) + "</td></tr>";
+  html += "</table></div>";
+  return html;
+}
+
+// Root page
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<title>Water Depth & Soil Monitor</title>";
+  html += "<style>body{font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;}";
+  html += ".reading{background:#f0f0f0;padding:20px;margin:20px 0;border-radius:8px;}";
+  html += "table{width:100%;border-collapse:collapse;}td,th{padding:8px;text-align:left;border:1px solid #ddd;}";
+  html += ".button{background-color:#4CAF50;color:white;padding:10px 20px;border:none;border-radius:4px;cursor:pointer;margin:5px;}";
+  html += ".button.secondary{background-color:#2196F3;}.button.danger{background-color:#f44336;}.button.soil{background-color:#795548;}";
+  html += ".status{padding:10px;margin:10px 0;border-radius:4px;}.success{background:#dff0d8;color:#3c763d;}";
+  html += ".info{background:#d9edf7;color:#31708f;}.error{background:#f2dede;color:#a94442;}</style>";
+  html += "<script>function updateReadings(){fetch('/readings').then(r=>r.text()).then(d=>{document.getElementById('readings').innerHTML=d;}).catch(e=>console.log(e));} setInterval(updateReadings,2000);window.onload=updateReadings;</script>";
+  html += "</head><body>";
+  html += "<h1>Water Depth & Soil Monitoring</h1>";
+  html += "<p style='text-align:center;color:#666;font-size:0.9em;'>v" + String(FIRMWARE_VERSION) + " | Device: " + String(DEVICE_ID) + "</p>";
+
+  if (millis() - lastConfigUpdate < 2000)
+    html += "<div class='status success'>Settings updated successfully</div>";
+
+  if (serverHost.isEmpty() || serverPath.isEmpty() || serverPort <= 0)
+    html += "<div class='status error'><strong>Server not configured!</strong> Go to <a href='/wifi-config'>Configuration</a> to set up.</div>";
+
+  html += "<div id='readings'>" + generateReadingsHtml() + "</div>";
+
+  html += "<div class='reading'><h2>Sensor Configuration</h2>";
+  html += "<form action='/configure' method='post'>";
+  html += "<table><tr><td>Sensor Height (cm):</td><td><input type='number' step='0.1' name='sensorHeight' value='" + String(sensorHeight, 1) + "' required></td></tr></table>";
+  html += "<input type='submit' value='Update Configuration' class='button'></form></div>";
+
+  html += "<div class='reading'><h2>Soil Moisture Calibration</h2>";
+  html += "<p>Calibrate Sensor to coresponding measurment";
+  html += "<table><tr><th>Sensor</th><th>Raw</th><th>%</th><th>Dry</th><th>Wet</th><th>Actions</th></tr>";
+  for (int i = 0; i < NUM_SOIL_SENSORS; i++) {
+    html += "<tr><td>" + String(i+1) + "</td><td>" + String(soilRaw[i]) + "</td><td>" + String(soilPercent[i]) + "%</td>";
+    html += "<td>" + String(soilDryValues[i]) + "</td><td>" + String(soilWetValues[i]) + "</td><td>";
+    html += "<form action='/set-soil-dry' method='post' style='display:inline;'><input type='hidden' name='sensor' value='" + String(i+1) + "'><input type='submit' value='Set Dry' class='button soil' style='padding:5px 10px;'></form> ";
+    html += "<form action='/set-soil-wet' method='post' style='display:inline;'><input type='hidden' name='sensor' value='" + String(i+1) + "'><input type='submit' value='Set Wet' class='button soil' style='padding:5px 10px;'></form>";
+    html += "</td></tr>";
+  }
+  html += "</table>";
+  html += "<form action='/reset-soil-calib' method='post'><input type='submit' value='Reset All to Defaults' class='button secondary'></form>";
+  html += "</div>";
+
+  html += "<div class='reading'><h2>Advanced Configuration</h2>";
+  html += "<p><a href='/wifi-config' class='button'>WiFi, AP, Server & OTA Settings</a></p></div>";
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+// Sensor height update
+void handleConfigure() {
+  if (server.hasArg("sensorHeight")) {
+    float newHeight = server.arg("sensorHeight").toFloat();
+    if (newHeight > 0 && newHeight != sensorHeight) {
+      sensorHeight = newHeight;
+      EEPROM.writeFloat(ADDR_SENSOR_HEIGHT, sensorHeight);
+      EEPROM.commit();
+      lastConfigUpdate = millis();
+    }
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+// WiFi configuration page
+void handleWiFiConfig() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<title>Configuration</title>";
+  html += "<style>body{font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;}";
+  html += ".config-form{background:#f0f0f0;padding:20px;margin:20px 0;border-radius:8px;}";
+  html += "input[type='text'],input[type='password'],input[type='number'],select{width:100%;padding:8px;margin:8px 0;box-sizing:border-box;}";
+  html += ".button{background-color:#4CAF50;color:white;padding:10px 20px;border:none;border-radius:4px;cursor:pointer;margin:5px;}";
+  html += ".button.secondary{background-color:#2196F3;}.button.danger{background-color:#f44336;}.button.server{background-color:#9C27B0;}";
+  html += ".status{padding:10px;margin:10px 0;border-radius:4px;}.success{background:#dff0d8;color:#3c763d;}";
+  html += ".info{background:#d9edf7;color:#31708f;}.error{background:#f2dede;color:#a94442;}";
+  html += ".tab{overflow:hidden;border:1px solid #ccc;background-color:#f1f1f1;}";
+  html += ".tab button{background-color:inherit;float:left;border:none;outline:none;cursor:pointer;padding:10px 16px;transition:0.3s;}";
+  html += ".tab button:hover{background-color:#ddd;}.tab button.active{background-color:#ccc;}";
+  html += ".tabcontent{display:none;padding:6px 12px;border:1px solid #ccc;border-top:none;}";
+  html += ".network-info{background:white;padding:15px;margin:10px 0;border-radius:5px;border:1px solid #ddd;}</style>";
+  html += "<script>";
+  html += "function togglePassword(id){var x=document.getElementById(id);if(x.type==='password'){x.type='text';}else{x.type='password';}}";
+  html += "function openTab(evt,tabName){var i,tc,tb;tc=document.getElementsByClassName('tabcontent');for(i=0;i<tc.length;i++){tc[i].style.display='none';}tb=document.getElementsByClassName('tabbutton');for(i=0;i<tb.length;i++){tb[i].className=tb[i].className.replace(' active','');}document.getElementById(tabName).style.display='block';evt.currentTarget.className+=' active';}";
+  html += "</script></head><body>";
+  html += "<h1>Configuration</h1>";
+
+  if      (server.hasArg("sta_saved"))    html += "<div class='status success'>WiFi configuration saved!</div>";
+  else if (server.hasArg("ap_saved"))     html += "<div class='status success'>AP configuration saved!</div>";
+  else if (server.hasArg("server_saved")) html += "<div class='status success'>Server configuration saved!</div>";
+
+  if (serverHost.isEmpty() || serverPath.isEmpty() || serverPort <= 0)
+    html += "<div class='status error'><strong>Server not configured!</strong> Please configure in 'Server Settings' tab.</div>";
+
+  html += "<div class='tab'>";
+  html += "<button class='tabbutton active' onclick=\"openTab(event,'STA')\">Connect to WiFi</button>";
+  html += "<button class='tabbutton' onclick=\"openTab(event,'AP')\">AP Settings</button>";
+  html += "<button class='tabbutton' onclick=\"openTab(event,'SERVER')\">Server Settings</button>";
+  html += "<button class='tabbutton' onclick=\"openTab(event,'OTA')\">Firmware Update</button>";
+  html += "</div>";
+
+  // STA tab
+  html += "<div id='STA' class='tabcontent' style='display:block;'>";
+  html += "<h2>WiFi Connection</h2><div class='network-info'><h3>Current Status</h3>";
+  if (wifiSTAConnected) {
+    html += "<p><strong>Connected to:</strong> " + sta_ssid + "</p>";
+    html += "<p><strong>IP:</strong> " + WiFi.localIP().toString() + "</p>";
+    html += "<p><strong>RSSI:</strong> " + String(WiFi.RSSI()) + " dBm</p>";
+  } else {
+    html += "<p><strong>Status:</strong> Not connected</p>";
+    if (sta_ssid.length() > 0)
+      html += "<p><strong>Last SSID:</strong> " + sta_ssid + "</p>";
+  }
+  html += "</div>";
+  html += "<form action='/save-sta' method='post' class='config-form'>";
+  html += "<h3>Configure WiFi</h3>";
+  html += "<label>WiFi SSID:</label><input type='text' name='sta_ssid' value='" + sta_ssid + "' required placeholder='Enter WiFi SSID'>";
+  html += generatePasswordField("sta_password", sta_password, "WiFi Password");
+  html += "<div style='text-align:center;'><input type='submit' value='Save & Connect' class='button'><input type='reset' value='Clear' class='button secondary'></div>";
+  html += "</form></div>";
+
+  // AP tab
+  html += "<div id='AP' class='tabcontent'>";
+  html += "<form action='/save-ap' method='post' class='config-form'>";
+  html += "<h3>Access Point (AP) Configuration</h3>";
+  html += "<label>AP SSID:</label><input type='text' name='ap_ssid' value='" + String(ap_ssid) + "' required>";
+  html += generatePasswordField("ap_password", ap_password, "AP Password");
+  html += "<p><small>AP password must be at least 8 characters</small></p>";
+  html += "<input type='submit' value='Save AP Configuration' class='button'>";
+  html += "</form></div>";
+
+  // Server tab
+  html += "<div id='SERVER' class='tabcontent'>";
+  html += "<form action='/save-server' method='post' class='config-form'>";
+  html += "<h3>Server Configuration</h3>";
+  html += "<label>Server Host:</label><input type='text' name='server_host' value='" + serverHost + "' required placeholder='e.g., www.example.com'>";
+  html += "<label>Server Path:</label><input type='text' name='server_path' value='" + serverPath + "' required placeholder='e.g., /api/data.php'>";
+  html += "<label>Server Port:</label><input type='number' name='server_port' value='" + String(serverPort == 0 ? 80 : serverPort) + "' min='1' max='65535' required placeholder='80'>";
+  html += "<p><small>Common ports: 80 (HTTP), 443 (HTTPS)</small></p>";
+  html += "<label>Update Interval (seconds):</label><input type='number' name='update_interval' value='" + String(serverUpdateInterval / 1000) + "' min='5' max='86400' required>";
+  html += "<div style='background:#f8e8f8;padding:10px;margin:10px 0;border-radius:5px;'>";
+  html += "<p><strong>Current:</strong> " + (serverHost.isEmpty() ? "Not set" : serverHost + ":" + String(serverPort) + serverPath) + "</p>";
+  html += "<p><strong>Interval:</strong> " + String(serverUpdateInterval / 1000) + " seconds</p>";
+  html += "</div>";
+  html += "<div style='text-align:center;'><input type='submit' value='Save Server Configuration' class='button server'></div>";
+  html += "</form></div>";
+
+  // OTA tab
+  html += "<div id='OTA' class='tabcontent'>";
+  html += "<div style='text-align:center;margin:20px 0;'>";
+  html += "<h3>Firmware Update</h3>";
+  html += "<p>Update device firmware</p>";
+  html += "<a href='/ota-update' class='button danger'>Update Firmware</a>";
+  html += "<div class='status info' style='margin-top:20px;'><p>Use only the correct .bin file for this device.</p></div>";
+  html += "</div></div>";
+
+  html += "<p><a href='/' class='button'>Return to Main Page</a></p>";
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+// Save handlers
+void handleSaveSTA() {
+  if (server.hasArg("sta_ssid") && server.arg("sta_ssid").length() > 0) {
+    saveWiFiCredentials(server.arg("sta_ssid"), server.arg("sta_password"), "");
+    WiFi.disconnect();
+    delay(500);
+    initializeWiFi();
+    server.sendHeader("Location", "/wifi-config?sta_saved=1");
+    server.send(303);
+    return;
+  }
+  server.sendHeader("Location", "/wifi-config");
+  server.send(303);
+}
+
+void handleSaveAP() {
+  if (server.hasArg("ap_ssid") && server.hasArg("ap_password")) {
+    String newSSID = server.arg("ap_ssid");
+    String newPass = server.arg("ap_password");
+    if (newSSID.length() > 0 && newPass.length() >= 8) {
+      saveWiFiCredentials("", "", newPass);
+      ap_ssid = newSSID.c_str();
+      WiFi.softAPdisconnect(true);
+      delay(500);
+      WiFi.softAP(ap_ssid, ap_password.c_str());
+      server.sendHeader("Location", "/wifi-config?ap_saved=1");
+      server.send(303);
+      return;
+    }
+  }
+  server.sendHeader("Location", "/wifi-config");
+  server.send(303);
+}
+
+void handleSaveServer() {
+  if (server.hasArg("server_host") && server.hasArg("server_path") &&
+      server.hasArg("server_port") && server.hasArg("update_interval")) {
+    String newHost      = server.arg("server_host");
+    String newPath      = server.arg("server_path");
+    int    newPort      = server.arg("server_port").toInt();
+    unsigned long newInterval = server.arg("update_interval").toInt() * 1000;
+    if (newHost.length() > 0 && newPath.length() > 0 && newPath.charAt(0) == '/' &&
+        newPort > 0 && newPort <= 65535 && newInterval >= 5000 && newInterval <= 86400000) {
+      saveServerConfig(newHost, newPath, newPort, newInterval);
+      server.sendHeader("Location", "/wifi-config?server_saved=1");
+      server.send(303);
+      return;
+    }
+  }
+  server.sendHeader("Location", "/wifi-config");
+  server.send(303);
+}
+
+// OTA handlers — FIXED: correct route setup, no division by zero
+void handleOTAUpdate() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<title>Firmware Update</title>";
+  html += "<style>body{font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;}";
+  html += ".update-form{background:#f0f0f0;padding:20px;margin:20px 0;border-radius:8px;}";
+  html += ".button{background-color:#4CAF50;color:white;padding:10px 20px;border:none;border-radius:4px;cursor:pointer;margin:5px;}";
+  html += ".button.danger{background-color:#f44336;}";
+  html += ".status{padding:10px;margin:10px 0;border-radius:4px;}.warning{background:#fcf8e3;color:#8a6d3b;}.info{background:#d9edf7;color:#31708f;}";
+  html += "#progress{width:100%;height:30px;background:#f0f0f0;border-radius:5px;overflow:hidden;margin:10px 0;}";
+  html += "#progress-bar{height:100%;background:#4CAF50;width:0%;transition:width 0.3s;text-align:center;line-height:30px;color:white;}</style>";
+
+  // ✅ FIX: uploadFirmware() uses XMLHttpRequest correctly — no double send()
+  html += "<script>";
+  html += "function uploadFirmware(){";
+  html += "  var file=document.getElementById('firmware').files[0];";
+  html += "  if(!file){alert('Please select a firmware file');return;}";
+  html += "  if(!file.name.endsWith('.bin')){alert('Please select a .bin file');return;}";
+  html += "  if(!confirm('Update firmware? Device will restart.'))return;";
+  html += "  var formData=new FormData();";
+  html += "  formData.append('file',file);";   // ← field name 'file'
+  html += "  var xhr=new XMLHttpRequest();";
+  html += "  document.getElementById('status').innerHTML='Uploading...';";
+  html += "  document.getElementById('progress').style.display='block';";
+  html += "  xhr.upload.addEventListener('progress',function(e){";
+  html += "    if(e.lengthComputable){";
+  html += "      var pct=(e.loaded/e.total)*100;";
+  html += "      document.getElementById('progress-bar').style.width=pct+'%';";
+  html += "      document.getElementById('progress-bar').innerHTML=Math.round(pct)+'%';";
+  html += "    }";
+  html += "  });";
+  html += "  xhr.addEventListener('load',function(){";
+  html += "    if(xhr.status===200){";
+  html += "      document.getElementById('status').innerHTML='Update successful! Device restarting...';";
+  html += "      document.getElementById('status').className='status info';";
+  html += "      setTimeout(function(){window.location.href='/';},10000);";
+  html += "    }else{";
+  html += "      document.getElementById('status').innerHTML='Update failed: '+xhr.responseText;";
+  html += "      document.getElementById('status').className='status warning';";
+  html += "    }";
+  html += "  });";
+  html += "  xhr.addEventListener('error',function(){";
+  html += "    document.getElementById('status').innerHTML='Upload error occurred';";
+  html += "    document.getElementById('status').className='status warning';";
+  html += "  });";
+  html += "  xhr.open('POST','/ota-upload');";
+  html += "  xhr.send(formData);";
+  html += "}";
+  html += "</script>";
+
+  html += "</head><body>";
+  html += "<h1>Firmware Update</h1>";
+  html += "<div class='status warning'><strong>Warning:</strong><br>Only upload firmware from Sinau Bumi Technician.<br>Do not disconnect power during update.</div>";
+  html += "<div class='update-form'><h3>Current Firmware</h3>";
+  html += "<p><strong>Device ID:</strong> " + String(DEVICE_ID) + "</p>";
+  html += "<p><strong>Firmware:</strong> " + String(FIRMWARE_NAME) + "</p>";
+  html += "<p><strong>Version:</strong> " + String(FIRMWARE_VERSION) + "</p>";
+  html += "<p><strong>SDK:</strong> " + String(ESP.getSdkVersion()) + "</p></div>";
+  html += "<div class='update-form'><h3>Upload New Firmware</h3>";
+  html += "<input type='file' id='firmware' accept='.bin' style='margin:10px 0;'><br>";
+  html += "<button onclick='uploadFirmware()' class='button danger'>Upload & Update</button>";
+  html += "<div id='progress' style='display:none;'><div id='progress-bar'>0%</div></div>";
+  html += "<div id='status' class='status info' style='margin-top:10px;'>Select a .bin file and click Upload</div>";
+  html += "</div>";
+  html += "<p><a href='/' class='button'>Return to Main Page</a></p>";
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleOTAUpload() {
+  HTTPUpload& upload = server.upload();
+
+  if (upload.status == UPLOAD_FILE_START) {
+    Serial.println("========================================");
+    Serial.printf("OTA Update Start: %s\n", upload.filename.c_str());
+    Serial.println("========================================");
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+      Update.printError(Serial);
+    }
+  }
+  else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      Update.printError(Serial);
+    } else {
+      // ✅ FIX: guard against division by zero when size is unknown
+      if (Update.size() > 0) {
+        Serial.printf("Progress: %d%%\r", (Update.progress() * 100) / Update.size());
+      } else {
+        Serial.printf("Written: %u bytes\r", Update.progress());
+      }
+    }
+  }
+  else if (upload.status == UPLOAD_FILE_END) {
+    if (Update.end(true)) {
+      Serial.printf("\nOTA Success: %u bytes written\n", upload.totalSize);
+      Serial.println("Rebooting...");
+      Serial.println("========================================");
+      delay(500);
+      ESP.restart();
+    } else {
+      Update.printError(Serial);
+    }
+  }
+}
+
+// Setup
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println("\n========================================");
+  Serial.println("Water Depth & 4-Sensor Soil Moisture System");
+  Serial.println("Device ID: " + String(DEVICE_ID));
+  Serial.println("Firmware:  " + String(FIRMWARE_VERSION));
+  Serial.println("========================================");
+
+  EEPROM.begin(EEPROM_SIZE);
+
+  if (EEPROM.read(ADDR_AP_PASS) == 255)
+    saveWiFiCredentials("", "", "12345678");
+
+  float savedHeight = EEPROM.readFloat(ADDR_SENSOR_HEIGHT);
+  if (!isnan(savedHeight) && savedHeight > 0) sensorHeight = savedHeight;
+
+  readWiFiCredentials();
+  readAPPassword();
+  readServerConfig();
+  readSoilCalibration();
+
+  // AJSR-04M GPIO mode: configure trigger (output) and echo (input) pins
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  digitalWrite(TRIG_PIN, LOW);
+
+  // Soil moisture pins: set attenuation to prevent floating/noise from ultrasonic
+  for (int i = 0; i < NUM_SOIL_SENSORS; i++) {
+    pinMode(soilPins[i], INPUT);
+    analogSetPinAttenuation(soilPins[i], ADC_11db); // full 0-3.3V range
+  }
+  initializeWiFi();
+  WiFi.scanNetworks(true);
+
+  server.on("/",              HTTP_GET,  handleRoot);
+  server.on("/readings",      HTTP_GET,  []() { server.send(200, "text/plain", generateReadingsHtml()); });
+  server.on("/configure",     HTTP_POST, handleConfigure);
+  server.on("/wifi-config",   HTTP_GET,  handleWiFiConfig);
+  server.on("/save-sta",      HTTP_POST, handleSaveSTA);
+  server.on("/save-ap",       HTTP_POST, handleSaveAP);
+  server.on("/save-server",   HTTP_POST, handleSaveServer);
+  server.on("/set-soil-dry",  HTTP_POST, handleSetSoilDry);
+  server.on("/set-soil-wet",  HTTP_POST, handleSetSoilWet);
+  server.on("/reset-soil-calib", HTTP_POST, handleResetSoilCalib);
+  server.on("/ota-update",    HTTP_GET,  handleOTAUpdate);
+
+  // ✅ FIX: empty completion handler — handleOTAUpload sends its own response (restart)
+  server.on("/ota-upload", HTTP_POST,
+    []() { /* handleOTAUpload handles the final response via ESP.restart() */ },
+    handleOTAUpload
+  );
+
+  server.begin();
+  Serial.println("Web server started.");
+  Serial.println("AP: " + String(ap_ssid) + " | IP: " + WiFi.softAPIP().toString());
+  Serial.println("OTA available at: /ota-update");
+  Serial.println("========================================");
+}
+
+// Main loop
+void loop() {
+  server.handleClient();
+  checkWiFiConnection();
+
+  static unsigned long lastSensorRead  = 0;
+  static unsigned long lastSoilRead    = 0;
+  static unsigned long lastStatusPrint = 0;
+  static WaterLevelData waterData      = {0, 0, false};
+
+  // Step 1: read ultrasonic every 1 second
+  if (millis() - lastSensorRead >= 1000) {
+    lastSensorRead = millis();
+    waterData = readWaterLevel();
+    getFormattedTimestamp(timeStampBuf, sizeof(timeStampBuf));
+
+    if (wifiSTAConnected && !serverHost.isEmpty() && !serverPath.isEmpty() && serverPort > 0)
+      serverConnected = sendToServer(waterData.waterDepth);
+  }
+
+  // Step 2: read soil 200ms AFTER ultrasonic trigger to avoid interference
+  if (millis() - lastSensorRead >= 200 && millis() - lastSoilRead >= 1000) {
+    lastSoilRead = millis();
+    readSoilMoisture();
+  }
+
+  if (millis() - lastStatusPrint >= 5000) {
+    lastStatusPrint = millis();
+    Serial.printf("\n=== System Status [%s] ===\n", timeStampBuf);
+    Serial.printf("Device: %s\n", DEVICE_ID);
+    Serial.printf("Water: sensor=%.1fcm depth=%.1fcm\n", waterData.sensorReading, waterData.waterDepth);
+    for (int i = 0; i < NUM_SOIL_SENSORS; i++)
+      Serial.printf("Soil %d: raw=%d %d%%\n", i+1, soilRaw[i], soilPercent[i]);
+    Serial.printf("WiFi STA: %s | RSSI: %d dBm\n", wifiSTAConnected ? "Connected" : "Disconnected", WiFi.RSSI());
+    Serial.printf("Server: %s | %s\n", serverConnected ? "Connected" : "Disconnected", lastServerStatus.c_str());
+    Serial.printf("==============================\n");
+  }
+
+  delay(10);
+}

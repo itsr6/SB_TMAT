@@ -40,7 +40,7 @@ def rename_firmware(source, target, env):
     output_dir = os.path.join(env.subst("$PROJECT_DIR"), "firmware")
     os.makedirs(output_dir, exist_ok=True)
 
-    dest_name = f"{device_id}_{firmware_version}.bin"
+    dest_name = f"{firmware_version}.bin"
     dest_bin  = os.path.join(output_dir, dest_name)
 
     shutil.copy(source_bin, dest_bin)

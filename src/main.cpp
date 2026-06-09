@@ -17,13 +17,12 @@
 // ============================================================
 // Firmware Information
 // ============================================================
-#define FIRMWARE_NAME    "TMAT"
-#define FIRMWARE_VERSION "2026-6.5.0.0-beta.1.0.6"
-#define FIRMWARE_AUTHOR  "Dep.Instrumen"
+#define FIRMWARE_NAME    "TMAT-ARGL"
+#define FIRMWARE_VERSION "20260609_TMAT_v5.2.0"
+#define FIRMWARE_AUTHOR  "Sinau Bumi"
 
 // ============================================================
 // Pin Configuration
-// ============================================================
 // ============================================================
 // ADS1115 — 16-bit I2C ADC (master ADC for 4-20mA water level)
 // ============================================================
@@ -33,9 +32,7 @@
 //   SDA  → GPIO8  (shared I2C bus with DFRobot rainfall)
 //   SCL  → GPIO9  (shared I2C bus with DFRobot rainfall)
 //   ADDR → GND    → I2C address 0x48
-//   AIN0 → tap point of 150Ω shunt (sensor+ side)
-//   AIN1–AIN3 → unused
-//
+//   AIN3 → tap point of 150Ω shunt (sensor+ side)
 // Voltage at 150Ω shunt: 4mA=0.600V  20mA=3.000V
 // ADS1115 PGA ±4.096V → resolution 0.125mV/bit → ~19,200 usable steps
 // I2C addresses: ADS1115=0x48  DFRobot SEN0575=0x1D  (no conflict)
@@ -62,7 +59,7 @@
 // ============================================================
 // EEPROM Layout
 // ============================================================
-#define EEPROM_SIZE          600
+#define EEPROM_SIZE          650
 #define ADDR_SENSOR_HEIGHT     0   // float  (4 bytes)
 #define ADDR_WIFI_SSID        10   // char[] (32)
 #define ADDR_WIFI_PASS        42   // char[] (32)
@@ -79,6 +76,7 @@
 #define ADDR_WATER_OFFSET    326   // float — soil offset (cm)
 #define ADDR_CAL_MA          330   // float — zero-point mA (mA reading at 0 cm)
 #define ADDR_CAL_MA_DEPTH    334   // float — unused (reserved)
+#define ADDR_DEVICE_ID       338   // char[] (32 bytes)
 
 #define MAX_CRED_LENGTH   32
 #define MAX_SERVER_LENGTH 64
@@ -99,7 +97,7 @@ String        serverPath           = "";
 int           serverPort           = 0;
 unsigned long serverUpdateInterval = 20000;
 
-#define DEVICE_ID "TMAT_LONSUM-2" // Diganti sesuai titik pemasangan
+String deviceId = "TMAT_ARGL";    // editable via web UI, persisted in EEPROM
 
 // ============================================================
 // NTP
@@ -554,6 +552,21 @@ void saveCalibrationOffsets() {
   EEPROM.commit();
 }
 
+void readDeviceId() {
+  char buf[MAX_CRED_LENGTH] = {0};
+  for (int i = 0; i < MAX_CRED_LENGTH; i++)
+    buf[i] = EEPROM.read(ADDR_DEVICE_ID + i);
+  String s = String(buf); s.trim();
+  if (s.length() > 0) deviceId = s;
+}
+
+void saveDeviceId(const String& id) {
+  for (int i = 0; i < MAX_CRED_LENGTH; i++)
+    EEPROM.write(ADDR_DEVICE_ID + i, i < (int)id.length() ? id[i] : 0);
+  EEPROM.commit();
+  deviceId = id;
+}
+
 void readUpdateInterval() {
   unsigned long interval = 0;
   for (int i = 0; i < 4; i++)
@@ -693,54 +706,83 @@ void checkWiFiConnection() {
 // Send to Server
 // ============================================================
 // ============================================================
-// SD CARD FUNCTIONS
+// SD CARD FUNCTIONS  (per-5-minute file strategy)
 // ============================================================
-String getSDFilePath(time_t epoch) {
-  struct tm t; localtime_r(&epoch, &t);
-  char buf[32]; strftime(buf, sizeof(buf), "/data/%Y-%m-%d.txt", &t);
+// Each 5-min NTP slot gets its own file:
+//   /data/2026_05_12_2000.txt   → slot starting 2026-05-12 20:00
+//   /data/2026_05_12_2005.txt   → slot starting 2026-05-12 20:05
+//   ...
+// Each file contains ONE header line + ONE data line.
+// On replay, startReplay() just collects all files whose slot epoch
+// is AFTER lastSuccessfulSendEpoch and queues them oldest-first.
+// No seeking inside files — much simpler and gap-proof.
+// ============================================================
+
+// Return the slot epoch (floor to 5-min boundary) for a given epoch
+time_t slotEpoch(time_t epoch) { return (epoch / 300) * 300; }
+
+// Build file path from a slot epoch: /data/YYYY_MM_DD_HHmm.txt
+String getSDFilePath(time_t slotEp) {
+  struct tm t; localtime_r(&slotEp, &t);
+  char buf[40];
+  strftime(buf, sizeof(buf), "/data/%Y_%m_%d_%H%M.txt", &t);
   return String(buf);
 }
 
+// CSV header (written once per file)
 const char* SD_HEADER = "epoch,timestamp,water_depth,sensor_raw,current_ma,"
                         "soil_temp,soil_humid,soil_ec,soil_ph,"
                         "rain_total,rain_1h,rain_rate,rain_tips,status";
 
+// Build the single CSV data line
 String buildCSVLine(float waterDepth, const char* status) {
   getFormattedTimestamp(timeStampBuf, sizeof(timeStampBuf));
   String line = String(getCurrentEpochTime()) + "," + String(timeStampBuf) + ","
               + String(waterDepth, 2) + "," + String(distance_cm, 2) + ","
               + String(currentMA, 3)  + ",";
   if (soilData.valid) {
-    line += String(round(soilData.temperature * 10)/10.0, 1) + ","
-          + String(round(soilData.humidity    * 10)/10.0, 1) + ","
-          + String((int)soilData.conductivity)                + ","
-          + String(round(soilData.ph          * 10)/10.0, 1) + ",";
+    line += String(round(soilData.temperature * 10) / 10.0, 1) + ","
+          + String(round(soilData.humidity    * 10) / 10.0, 1) + ","
+          + String((int)soilData.conductivity)                  + ","
+          + String(round(soilData.ph          * 10) / 10.0, 1) + ",";
   } else { line += ",,,,"; }
   if (rainData.valid) {
-    line += String(round(rainData.rainfallTotal*100)/100.0, 2) + ","
-          + String(round(rainData.rainfall1h   *100)/100.0, 2) + ","
-          + String(round(rainData.rainRate      *100)/100.0, 2) + ","
+    line += String(round(rainData.rainfallTotal * 100) / 100.0, 2) + ","
+          + String(round(rainData.rainfall1h    * 100) / 100.0, 2) + ","
+          + String(round(rainData.rainRate       * 100) / 100.0, 2) + ","
           + String((int)rainData.rawTipCount) + ",";
   } else { line += ",,,,"; }
   line += String(status);
   return line;
 }
 
+// Write one record into the slot file for the current 5-min boundary.
+// The slot epoch is floor(now/300)*300, matching the file name.
+// If the file already exists (duplicate trigger in same slot) we skip writing
+// so every file always has exactly one data row.
 void writeSDRecord(float waterDepth, const char* status) {
   if (!sdAvailable) return;
-  time_t epoch = getCurrentEpochTime();
-  if (epoch < 1000000) return;
-  String path = getSDFilePath(epoch);
-  if (!SD.exists(path)) {
-    File f = SD.open(path, FILE_WRITE);
-    if (f) { f.println(SD_HEADER); f.close(); }
+  time_t now  = getCurrentEpochTime();
+  if (now < 1000000) return;
+  time_t slot = slotEpoch(now);
+  String path = getSDFilePath(slot);
+  if (SD.exists(path)) {
+    // Already written for this slot — do not overwrite (idempotent)
+    Serial.printf("[SD] Slot file exists, skip duplicate write: %s\n", path.c_str());
+    return;
   }
-  File f = SD.open(path, FILE_APPEND);
-  if (f) { f.println(buildCSVLine(waterDepth, status)); f.close();
+  File f = SD.open(path, FILE_WRITE);
+  if (f) {
+    f.println(SD_HEADER);
+    f.println(buildCSVLine(waterDepth, status));
+    f.close();
     Serial.printf("[SD] Written %s [%s]\n", path.c_str(), status);
+  } else {
+    Serial.printf("[SD] ERROR opening %s for write\n", path.c_str());
   }
 }
 
+// ---- Persist last successfully sent epoch ----
 void saveLastSendEpoch(time_t epoch) {
   if (!sdAvailable) return;
   if (!SD.exists("/state")) SD.mkdir("/state");
@@ -757,6 +799,7 @@ time_t loadLastSendEpoch() {
   return (time_t)s.toInt();
 }
 
+// ---- NTP-aligned 5-min recording schedule ----
 time_t nextAligned5Min(time_t now) { return ((now / 300) + 1) * 300; }
 
 void checkSDSchedule(float waterDepth) {
@@ -765,27 +808,46 @@ void checkSDSchedule(float waterDepth) {
   if (now < 1000000) return;
   if (nextSDRecord == 0) {
     nextSDRecord = nextAligned5Min(now);
-    Serial.printf("[SD] First record at epoch %lu\n", (unsigned long)nextSDRecord);
+    Serial.printf("[SD] First record scheduled at epoch %lu\n", (unsigned long)nextSDRecord);
     return;
   }
   if (now >= nextSDRecord) {
     writeSDRecord(waterDepth, "LIVE");
     nextSDRecord += 300;
-    Serial.printf("[SD] Next record at epoch %lu\n", (unsigned long)nextSDRecord);
+    Serial.printf("[SD] Next record scheduled at epoch %lu\n", (unsigned long)nextSDRecord);
   }
 }
 
-bool replaySendLine(const String& line) {
-  if (line.startsWith("epoch") || line.length() < 10) return false;
-  int idx = 0; String fields[14]; int fc = 0;
+// ---- Send one 5-min file to the server (replay) ----
+// Reads the data line from the file (skips the header), parses CSV, POSTs JSON.
+bool replaySendFile(const String& path) {
+  File f = SD.open(path, FILE_READ);
+  if (!f) { Serial.printf("[SD Replay] Cannot open %s\n", path.c_str()); return false; }
+
+  // Skip header line, read the single data line
+  String header = f.readStringUntil('\n');
+  String line   = f.readStringUntil('\n');
+  f.close();
+  line.trim();
+
+  if (line.length() < 10 || line.startsWith("epoch")) {
+    Serial.printf("[SD Replay] Empty/invalid file: %s\n", path.c_str());
+    return false;
+  }
+
+  // Parse CSV fields
+  String fields[14]; int fc = 0, idx = 0;
   while (idx < (int)line.length() && fc < 14) {
     int c = line.indexOf(',', idx);
     if (c == -1) c = line.length();
-    fields[fc++] = line.substring(idx, c); idx = c + 1;
+    fields[fc++] = line.substring(idx, c);
+    idx = c + 1;
   }
-  if (fc < 5) return false;
+  if (fc < 5) { Serial.printf("[SD Replay] Too few fields in %s\n", path.c_str()); return false; }
+
+  // Build JSON payload
   JsonDocument doc;
-  doc["device_id"]   = DEVICE_ID;
+  doc["device_id"]   = deviceId;
   doc["epoch_time"]  = (unsigned long)fields[0].toInt();
   doc["timestamp"]   = fields[1];
   doc["water_depth"] = fields[2].toFloat();
@@ -800,123 +862,120 @@ bool replaySendLine(const String& line) {
   if (fields[11].length() > 0) doc["rain_rate"]  = fields[11].toFloat();
   if (fields[12].length() > 0) doc["rain_tips"]  = fields[12].toInt();
   doc["recovered"] = true;
+
   String json; serializeJson(doc, json);
+
   WiFiClientSecure client; client.setInsecure();
-  if (!client.connect(serverHost.c_str(), serverPort)) return false;
+  if (!client.connect(serverHost.c_str(), serverPort)) {
+    Serial.printf("[SD Replay] Connect failed for %s\n", path.c_str());
+    return false;
+  }
   client.print("POST " + serverPath + " HTTP/1.1\r\nHost: " + serverHost
     + "\r\nContent-Type: application/json\r\nContent-Length: "
     + json.length() + "\r\nConnection: close\r\n\r\n" + json);
+
   unsigned long t = millis(); int code = 0;
-  while (client.connected() && millis()-t < 8000) {
+  while (client.connected() && millis() - t < 8000) {
     while (client.available()) {
       String ln = client.readStringUntil('\n');
       if (ln.startsWith("HTTP/1.1")) {
-        int s1=ln.indexOf(' '), s2=ln.indexOf(' ',s1+1);
-        if (s1>0) code=ln.substring(s1+1,s2).toInt();
+        int s1 = ln.indexOf(' '), s2 = ln.indexOf(' ', s1 + 1);
+        if (s1 > 0) code = ln.substring(s1 + 1, s2).toInt();
       }
     }
   }
   client.stop();
-  Serial.printf("[SD Replay] epoch=%s HTTP=%d\n", fields[0].c_str(), code);
+  Serial.printf("[SD Replay] %s → HTTP %d\n", path.c_str(), code);
   return (code == 200);
 }
 
-
-// ---- Replay queue: up to 8 pending files, oldest first ----
-#define REPLAY_MAX_FILES 8
+// ---- Replay queue: up to 288 files (24h × 12 slots/h) ----
+// Using a larger queue because each slot is its own file now.
+// Memory: each String path is ~28 bytes → 288 × 28 ≈ 8 KB, fine for ESP32.
+#define REPLAY_MAX_FILES 288
 String replayQueue[REPLAY_MAX_FILES];
 int    replayQueueHead  = 0;
 int    replayQueueCount = 0;
 
-// Advance replay to the next queued file (called when current file finishes)
 void advanceReplayQueue() {
   replayQueueHead++;
   if (replayQueueHead >= replayQueueCount) {
-    sdReplayActive  = false;
-    replayQueueHead = 0;
+    sdReplayActive   = false;
+    replayQueueHead  = 0;
     replayQueueCount = 0;
-    Serial.println("[SD Replay] All files replayed.");
+    Serial.println("[SD Replay] All missed files replayed.");
     return;
   }
   replayFile      = replayQueue[replayQueueHead];
-  replayLineIndex = 0;
-  Serial.printf("[SD Replay] Advancing to next file: %s\n", replayFile.c_str());
+  replayLineIndex = 0;  // unused for per-file strategy, kept for compat
+  Serial.printf("[SD Replay] Next file: %s (%d/%d)\n",
+                replayFile.c_str(), replayQueueHead + 1, replayQueueCount);
 }
 
+// Called every 2-second loop: send one file per call to avoid blocking
 void replayNextRecord() {
   if (!sdReplayActive || !sdAvailable || !wifiSTAConnected) return;
   if (serverHost.isEmpty() || serverPath.isEmpty() || serverPort <= 0) return;
-  File f = SD.open(replayFile, FILE_READ);
-  if (!f) { advanceReplayQueue(); return; }
-  int lineNum = 0; String line = "";
-  while (f.available()) {
-    line = f.readStringUntil('\n'); line.trim();
-    if (lineNum == replayLineIndex) break;
-    lineNum++;
+
+  bool ok = replaySendFile(replayFile);
+  if (ok) {
+    // Update lastSuccessfulSendEpoch from the file name slot epoch so we can
+    // resume correctly if WiFi drops again mid-replay.
+    // File name pattern: /data/YYYY_MM_DD_HHmm.txt
+    // Extract slot epoch by finding the file whose name we know.
+    struct tm t = {};
+    const char* fn = replayFile.c_str();
+    // sscanf the YYYY_MM_DD_HHmm part (skip leading "/data/")
+    int yr, mo, dy, hh, mm;
+    if (sscanf(fn, "/data/%4d_%2d_%2d_%2d%2d.txt", &yr, &mo, &dy, &hh, &mm) == 5) {
+      t.tm_year = yr - 1900; t.tm_mon = mo - 1; t.tm_mday = dy;
+      t.tm_hour = hh;        t.tm_min = mm;      t.tm_sec  = 0;
+      t.tm_isdst = -1;
+      time_t slotEp = mktime(&t);
+      if (slotEp > lastSuccessfulSendEpoch) {
+        lastSuccessfulSendEpoch = slotEp;
+        saveLastSendEpoch(slotEp);
+      }
+    }
   }
-  f.close();
-  if (lineNum < replayLineIndex || line.length() < 10) {
-    // Current file exhausted — move to next file in queue
-    Serial.printf("[SD Replay] Complete — %s done\n", replayFile.c_str());
-    advanceReplayQueue(); return;
-  }
-  if (!line.startsWith("epoch")) replaySendLine(line);
-  replayLineIndex++;
+  // Whether success or fail, advance to next file.
+  // Failed files will be re-queued on the next startReplay() call.
+  advanceReplayQueue();
 }
 
+// Build replay queue from SD: collect all slot files with epoch > lastSuccessfulSendEpoch,
+// sorted oldest-first. No file-content scanning needed — the epoch is in the filename.
 void startReplay() {
   if (!sdAvailable) return;
   time_t fromEpoch = loadLastSendEpoch();
-  if (fromEpoch == 0) return;
-  time_t now = getCurrentEpochTime();
+  time_t now       = getCurrentEpochTime();
 
-  // Build queue oldest-first (d=7 is oldest day, d=0 is today)
   replayQueueHead  = 0;
   replayQueueCount = 0;
-  for (int d = 7; d >= 0; d--) {
-    String path = getSDFilePath(now - d * 86400);
-    if (!SD.exists(path)) continue;
-    // Check if this file has any record newer than fromEpoch
-    File f = SD.open(path, FILE_READ); if (!f) continue;
-    bool hasNew = false;
-    while (f.available()) {
-      String line = f.readStringUntil('\n'); line.trim();
-      if (line.startsWith("epoch") || line.length() < 5) continue;
-      int comma = line.indexOf(',');
-      if (comma > 0 && (time_t)line.substring(0, comma).toInt() > fromEpoch) {
-        hasNew = true; break;
-      }
-    }
-    f.close();
-    if (hasNew && replayQueueCount < REPLAY_MAX_FILES) {
-      replayQueue[replayQueueCount++] = path;
-      Serial.printf("[SD Replay] Queued: %s\n", path.c_str());
-    }
+
+  // Scan up to 7 days back (7 × 24 × 12 = 2016 possible slots).
+  // We walk slot by slot oldest-first so the queue is already sorted.
+  time_t scanStart = now - 7 * 86400;
+  // Align to 5-min boundary
+  scanStart = slotEpoch(scanStart);
+
+  for (time_t sl = scanStart; sl <= now && replayQueueCount < REPLAY_MAX_FILES; sl += 300) {
+    if (sl <= fromEpoch) continue;          // already sent
+    String path = getSDFilePath(sl);
+    if (!SD.exists(path)) continue;         // gap in recording (offline/no SD)
+    replayQueue[replayQueueCount++] = path;
   }
 
   if (replayQueueCount == 0) {
-    Serial.println("[SD Replay] No missed records");
+    Serial.println("[SD Replay] No missed records found.");
     return;
   }
 
-  // Start with the first (oldest) file, seek past already-sent lines
   replayFile      = replayQueue[0];
   replayLineIndex = 0;
   sdReplayActive  = true;
-
-  File f = SD.open(replayFile, FILE_READ); if (!f) return;
-  int ln = 0;
-  while (f.available()) {
-    String line = f.readStringUntil('\n'); line.trim(); ln++;
-    if (line.startsWith("epoch") || line.length() < 5) continue;
-    int comma = line.indexOf(',');
-    if (comma > 0 && (time_t)line.substring(0, comma).toInt() > fromEpoch) {
-      replayLineIndex = ln - 1;
-      Serial.printf("[SD Replay] Start %s from line %d\n", replayFile.c_str(), replayLineIndex);
-      break;
-    }
-  }
-  f.close();
+  Serial.printf("[SD Replay] Queued %d missed files, starting with %s\n",
+                replayQueueCount, replayFile.c_str());
 }
 
 void setupSD() {
@@ -929,7 +988,7 @@ void setupSD() {
   if (!SD.exists("/data"))  SD.mkdir("/data");
   if (!SD.exists("/state")) SD.mkdir("/state");
   lastSuccessfulSendEpoch = loadLastSendEpoch();
-  uint64_t mb = SD.cardSize()/(1024*1024);
+  uint64_t mb = SD.cardSize() / (1024 * 1024);
   Serial.printf("[SD] Ready %lluMB  lastSend=%lu\n", mb, (unsigned long)lastSuccessfulSendEpoch);
 }
 
@@ -952,7 +1011,7 @@ bool sendToServer(float waterDepth) {
   getFormattedTimestamp(timeStampBuf, sizeof(timeStampBuf));
 
   JsonDocument doc;
-  doc["device_id"]     = DEVICE_ID;
+  doc["device_id"]     = deviceId;
   doc["epoch_time"]    = getCurrentEpochTime();
   doc["timestamp"]     = timeStampBuf;
   // Water level
@@ -1064,7 +1123,7 @@ String generateReadingsHtml() {
   WaterLevelData wd = readWaterLevel();
 
   String h = "<div class='card'><h3>Water Level</h3><table>";
-  h += "<tr><td>Device ID</td><td>"        + String(DEVICE_ID)              + "</td></tr>";
+  h += "<tr><td>Device ID</td><td>"        + deviceId                         + "</td></tr>";
   h += "<tr><td>Current (mA)</td><td>"     + String(currentMA, 2)           + " mA</td></tr>";
   h += "<tr><td>Pressure Depth</td><td>"   + String(wd.sensorReading, 1)    + " cm</td></tr>";
   h += "<tr><td>Soil Offset</td><td>"      + String(waterOffset, 1)         + " cm</td></tr>";
@@ -1400,6 +1459,8 @@ void handleWiFiConfig() {
   html += "<div id='SRV' class='tc'>"
     "<form action='/save-server' method='post' class='card'>"
     "<h3>Server Configuration</h3>"
+    "<label>Device ID:</label>"
+    "<input type='text' name='device_id' value='" + deviceId + "' required placeholder='TMAT_ARGL' maxlength='31'>"
     "<label>Host:</label>"
     "<input type='text' name='server_host' value='" + serverHost + "' required placeholder='www.host.com'>"
     "<label>Path:</label>"
@@ -1443,6 +1504,10 @@ void handleSaveServer() {
     unsigned long iv = server.arg("update_interval").toInt() * 1000UL;
     if (h.length()>0 && p.length()>0 && p[0]=='/' && pt>0 && pt<=65535 && iv>=5000) {
       saveServerConfig(h, p, pt, iv);
+      if (server.hasArg("device_id")) {
+        String newId = server.arg("device_id"); newId.trim();
+        if (newId.length() > 0) saveDeviceId(newId);
+      }
       server.sendHeader("Location", "/wifi-config?server_saved=1");
       server.send(303); return;
     }
@@ -1485,7 +1550,7 @@ void handleOTAUpdate() {
   html += "<h1>Firmware Update</h1>";
   html += "<div class='al wn'><b>Warning:</b> Only use firmware from Sinau Bumi Technician. "
           "Do not cut power during update.</div>";
-  html += "<div class='card'><b>Device:</b> " + String(DEVICE_ID)
+  html += "<div class='card'><b>Device:</b> " + deviceId
         + " &nbsp;|&nbsp; <b>FW:</b> " + String(FIRMWARE_NAME) + " v" + String(FIRMWARE_VERSION)
         + " &nbsp;|&nbsp; <b>SDK:</b> " + String(ESP.getSdkVersion()) + "</div>";
   html += "<div class='card'>"
@@ -1572,6 +1637,7 @@ void setup() {
   readWiFiCredentials();
   readServerConfig();
   readCalibrationOffsets();
+  readDeviceId();
 
   Serial.printf("Cal loaded: zeroMA=%.2fmA offset=%.1fcm T%+.2f H%+.2f EC%+.1f pH%+.2f\n",
     zeroMA, waterOffset, calTempOffset, calHumidOffset, calEcOffset, calPhOffset);
@@ -1716,9 +1782,10 @@ void loop() {
       wifiSTAConnected ? WiFi.localIP().toString().c_str() : "Disconnected",
       WiFi.RSSI(), apEnabled ? "ON" : "OFF", WiFi.softAPgetStationNum());
     Serial.printf("Server : %s\n", lastServerStatus.c_str());
-    Serial.printf("SD     : %s | Replay:%s | NextRecord in %lus\n",
+    Serial.printf("SD     : %s | Replay:%s (%d/%d) | NextRecord in %lus\n",
       sdAvailable ? "OK" : "NO CARD",
       sdReplayActive ? replayFile.c_str() : "idle",
+      sdReplayActive ? replayQueueHead + 1 : 0, replayQueueCount,
       nextSDRecord > 0 ? (unsigned long)(nextSDRecord - getCurrentEpochTime()) : 0UL);
     Serial.println("=================================");
   }

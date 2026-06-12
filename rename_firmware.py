@@ -36,7 +36,7 @@ def rename_firmware(source, target, env):
         return
 
     # --- Build output filename ---
-    # Output: firmware/<DEVICE_ID>_<FIRMWARE_VERSION>.bin
+    # Output: firmware/<FIRMWARE_VERSION>.bin
     output_dir = os.path.join(env.subst("$PROJECT_DIR"), "firmware")
     os.makedirs(output_dir, exist_ok=True)
 

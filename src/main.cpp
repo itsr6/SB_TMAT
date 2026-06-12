@@ -18,7 +18,7 @@
 // Firmware Information
 // ============================================================
 #define FIRMWARE_NAME    "TMAT-ARGL"
-#define FIRMWARE_VERSION "20260609_TMAT_v5.2.0"
+#define FIRMWARE_VERSION "20260612_TMAT_v5.2.1"
 #define FIRMWARE_AUTHOR  "Sinau Bumi"
 
 // ============================================================
@@ -106,6 +106,7 @@ const char* ntpServer1         = "pool.ntp.org";
 const char* ntpServer2         = "time.nist.gov";
 const long  gmtOffset_sec      = 25200;  // GMT+7
 const int   daylightOffset_sec = 0;
+#define NTP_RESYNC_INTERVAL   (6UL * 3600UL * 1000UL)  // re-sync NTP every 6 hours
 
 // ============================================================
 // Defaults
@@ -687,18 +688,53 @@ void checkAPButton() {
 }
 
 void checkWiFiConnection() {
+  // Bug fix: update flag every loop iteration so callers always see current state
+  wifiSTAConnected = (WiFi.status() == WL_CONNECTED);
+
+  // Periodic NTP re-sync every 6 hours to prevent clock drift
+  if (wifiSTAConnected && timeInitialized &&
+      millis() - lastTimeSync > NTP_RESYNC_INTERVAL) {
+    Serial.println("[NTP] Periodic re-sync (6h interval)...");
+    timeInitialized = false;
+    initializeTime();
+  }
+
+  // Only attempt reconnect every 30 seconds to avoid hammering the AP
   if (millis() - lastWifiReconnect < 30000) return;
   lastWifiReconnect = millis();
+
+  if (WiFi.status() == WL_CONNECTED) return;  // already good
+
+  if (sta_ssid.length() == 0) return;  // no credentials saved, nothing to do
+
+  wifiSTAConnected = false;
+  Serial.println("[WiFi] Disconnected — attempting WiFi.reconnect()...");
+
+  // --- Step 1: try the fast path first ---
+  WiFi.reconnect();
+  unsigned long t = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t < 10000) {
+    delay(500); Serial.print(".");
+  }
+
+  // --- Step 2: if still not connected, do a full WiFi.begin() ---
   if (WiFi.status() != WL_CONNECTED) {
-    wifiSTAConnected = false;
-    WiFi.reconnect();
-    unsigned long t = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t < 10000) { delay(500); Serial.print("."); }
-    if (WiFi.status() == WL_CONNECTED) {
-      wifiSTAConnected = true;
-      Serial.println("\nWiFi reconnected!");
-      if (!timeInitialized) initializeTime();
+    Serial.println("\n[WiFi] reconnect() failed — doing full WiFi.disconnect + WiFi.begin()...");
+    WiFi.disconnect(true);   // force-clear the driver's internal state
+    delay(500);
+    WiFi.begin(sta_ssid.c_str(), sta_password.c_str());
+    t = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t < 15000) {
+      delay(500); Serial.print(".");
     }
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiSTAConnected = true;
+    Serial.println("\n[WiFi] Reconnected! IP: " + WiFi.localIP().toString());
+    if (!timeInitialized) initializeTime();
+  } else {
+    Serial.println("\n[WiFi] Still disconnected — will retry in 30s");
   }
 }
 
@@ -1674,6 +1710,7 @@ void setup() {
   }
 
   initializeWiFi();
+  lastWifiReconnect = millis();  // start the 30s reconnect timer from now, not from t=0
   // Check button state at boot so AP starts immediately if held
   checkAPButton();
   WiFi.scanNetworks(true);
@@ -1725,6 +1762,8 @@ void loop() {
 
   if (otaInProgress) { delay(10); return; }
 
+  // checkWiFiConnection() updates wifiSTAConnected flag every call,
+  // and handles reconnect + NTP re-sync on a 30s / 6h schedule.
   checkWiFiConnection();
 
   // Detect WiFi reconnection → trigger replay of missed SD records

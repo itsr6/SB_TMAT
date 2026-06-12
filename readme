@@ -1,46 +1,8 @@
-# TMAT - Tinggi Muka Air Tanah
-
-## Pin Configuration
-
-| Function  | GPIO   |
-| --------- | ------ |
-| Soil RX   | GPIO16 |
-| Soil TX   | GPIO17 |
-| I2C SDA   | GPIO8  |
-| I2C SCL   | GPIO9  |
-| SD CS     | GPIO10 |
-| SD MOSI   | GPIO11 |
-| SD MISO   | GPIO13 |
-| SD SCK    | GPIO12 |
-| AP Button | GPIO7  |
-
----
-
-## Data Flow
-
-Sensors
-↓
-Logger
-↓
-Local Processing
-↓
-SD Card Backup
-↓
-HTTPS Upload
-↓
-Cloud Server
-
-If the server connection fails:
-
-Sensors
-↓
-Logger
-↓
-SD Card Storage
-↓
-Automatic Replay After Reconnection
-
----
+# TMAT 
+Update ver.20260612_TMAT_v5.2.1
+- fix wifi reconnect bug
+- change the sdcard record file type, from perday file to per 5 minuit file
+- 
 
 ## Testing dashboard
 https://dev.sinaubumi.org/
@@ -48,7 +10,7 @@ https://dev.sinaubumi.org/
 ### Calibration
 
 
-## Telemetry Payload Example
+### Data Example
 
 ```json
 {
@@ -66,31 +28,8 @@ https://dev.sinaubumi.org/
   "rain_rate": 3.36,
   "rain_tips": 44
 }
-```
 
-## Versioning
-
-Firmware versions follow the format:
-
-```
-v5.2.0
-```
-
----
-
-## Project Status
-
-Testing Development
-
-Current Firmware:
-
-```
-20260609_TMAT_v5.2.0
-```
-
----
-
-## License
+### License
 
 Copyright © Sinau Bumi
 

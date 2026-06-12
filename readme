@@ -1,16 +1,15 @@
-# TMAT 
+TMAT 
 Update ver.20260612_TMAT_v5.2.1
 - fix wifi reconnect bug
 - change the sdcard record file type, from perday file to per 5 minuit file
-- 
 
-## Testing dashboard
+Testing dashboard
 https://dev.sinaubumi.org/
 
-### Calibration
+Calibration
 
 
-### Data Example
+Data Example
 
 ```json
 {
@@ -29,7 +28,7 @@ https://dev.sinaubumi.org/
   "rain_tips": 44
 }
 
-### License
+License
 
 Copyright © Sinau Bumi
 
